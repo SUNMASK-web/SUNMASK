@@ -1,0 +1,18 @@
+These folders contain various midi results from the SUNMASK paper. For listening to these midi files, we use the "timidity" commandline program, though many midi players may suffice. 
+
+evaluation_sampled_mid_many_cleanup/top_20/*.mid represents the best curated samples from SUNMASK.
+
+
+
+For all midis, we present 3 formats "raw" which is the sound rendered with an acoustic grand piano midi soundfont, "voice" which uses a choral type soundfont, and "quartet" which uses a combination of oboe, English horn, clarinet, and bassoon. For the top 20 these are further rendered at 90, 60, and 60 bpm respectively.
+
+As an example to listen to all quartet format midis in the "top 20" folder, we use the following command `timidity evaluation_sampled_mid_many_cleanup/top_20/download_sunmask_typical_True_*quartet*.mid` . Similar can be used for any of the midi files in this supplemental folder.
+
+
+
+
+evaluation_sampled_mid_many_cleanup/ shows the experimental results of generating 200 samples with the best performing midi model, and selecting a "greatest hits" of the top 20 according to the grading metric. We also include an example of the "grading reports" used for this analysis in this folder.
+
+evaluation_sampled_mid_fixedbpm/ contains the midi files which were graded to create Table 1 in the paper. All were generated at a BPM of 50, though the grading metric is independent of the BPM codified in the midi file itself.
+
+evalution_sampled_mid_inpainting/ contains the infilling resuls for generated versions of "Ode to Joy" harmonizations, as shown in Figures 3:9 of the SUNMASK paper.
