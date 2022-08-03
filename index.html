@@ -38,19 +38,6 @@ function toDataURL(url, callback) {
   xhr.send();
 }
 
-function SUNMASKtop20Button() {
-toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_36.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_36.mid", dataUrl);
-                      //console.log('RESULT:', dataUrl);
-   });
-};
-
-function Coconettop20Button() {
-toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/coconet/coconet_sample_0.mid", function(dataUrl) {loadURLFile("Coconet_0.mid", dataUrl);
-                      //console.log('RESULT:', dataUrl);
-   });
-};
-
-
 function loadURLFile(name, fURL) {
     if(songs[escape(name)]) return;
     songs[escape(name)] = fURL;
@@ -256,12 +243,80 @@ function sliderChange4(val) {
 function sliderChange5(val) {
     document.getElementById('output5').innerHTML = val;
 }
-function loadSUNMASKtop20Playlist() {
-    SUNMASKtop20Button();
+
+function SUNMASKtop201to10() {
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_36.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_1_36.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_89.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_2_89.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_125.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_3_125.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_146.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_4_146.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_170.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_5_170.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_108.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_6_108.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_56.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_7_56.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_69.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_8_69.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_58.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_9_58.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_85.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_19_85.mid", dataUrl); });
+};
+
+function SUNMASKtop2011to20() {
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_36.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_36.mid", dataUrl);
+                      //console.log('RESULT:', dataUrl);
+   });
+};
+
+function SUNMASKCallback(){
+   var e = document.getElementById("SUNMASKDropdown");
+   var value = e.value;
+   var text = e.options[e.selectedIndex].text;
+   if (e.selectedIndex == 1){
+       SUNMASKtop201to10();
+   } else if (e.selectedIndex == 2){
+       SUNMASKtop2011to20();
+   } else {
+   };
 }
-function loadCoconetPlaylist() {
-    Coconettop20Button();
+
+function Coconet1to10() {
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/coconet/coconet_sample_0.mid", function(dataUrl) {loadURLFile("Coconet_0.mid", dataUrl);
+                      //console.log('RESULT:', dataUrl);
+   });
+};
+
+function Coconet11to20() {
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/coconet/coconet_sample_0.mid", function(dataUrl) {loadURLFile("Coconet_0.mid", dataUrl);
+                      //console.log('RESULT:', dataUrl);
+   });
+};
+
+function CoconetCallback(){
+   var e = document.getElementById("CoconetDropdown");
+   var value = e.value;
+   var text = e.options[e.selectedIndex].text;
+   if (e.selectedIndex == 1){
+       Coconet1to10();
+   } else if (e.selectedIndex == 2){
+       Coconet11to20();
+   } else {
+   };
 }
+
+function SUNMASKOdeAll() {
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/coconet/coconet_sample_0.mid", function(dataUrl) {loadURLFile("Coconet_0.mid", dataUrl);
+                      //console.log('RESULT:', dataUrl);
+   });
+};
+
+function SUNMASKOdeCallback(){
+   var e = document.getElementById("SUNMASKOdeDropdown");
+   var value = e.value;
+   var text = e.options[e.selectedIndex].text;
+   if (e.selectedIndex == 1){
+       SUNMASKOdeAll();
+   } 
+    else {
+   };
+}
+
+
 function stopAudio() {
     document.getElementById('scrollbar').style.animation = "none";
     document.getElementById('scrollbar').style.transitionTimingFunction = null;
@@ -331,9 +386,21 @@ function clearPlaylist() {
 <div style="height:20px"></div>
 <div id="playlist" class="panel">
     <div class="container">
-        <button onclick="loadSUNMASKtop20Playlist()">Load SUNMASK Top 20 playlist</button>
-        <button onclick="loadCoconetPlaylist()">Load Coconet playlist</button>
-        <div style="display:inline-block;width:60px">     </div>
+        <select id="SUNMASKDropdown", onchange="SUNMASKCallback();" onfocus="this.selectedIndex=-1;this.blur();">
+            <option> -- Load SUNMASK Top 20 Playlist -- </option>
+            <option>SUNMASK Top 20 (1-10)</option>
+            <option>SUNMASK Top 20 (11-20)</option>
+        </select>
+        <select id="CoconetDropdown", onchange="CoconetCallback();" onfocus="this.selectedIndex=-1;this.blur();">
+            <option> -- Load Coconet Playlist -- </option>
+            <option>Coconet (1-10)</option>
+            <option>Coconet (11-20)</option>
+        </select>
+        <select id="SUNMASKOdeDropdown", onchange="SUNMASKOdeCallback();" onfocus="this.selectedIndex=-1;this.blur();">
+            <option> -- Load SUNMASK Ode Infill Playlist -- </option>
+            <option>SUNMASK Ode Infill (All)</option>
+        </select>
+        <div style="display:inline-block;width:20px">     </div>
         <button onclick="clearPlaylist()">Clear playlist</button>
         <input type="file" id="files" name="files" multiple />
         <div id="playlist-list">
