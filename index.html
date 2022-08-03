@@ -321,9 +321,13 @@ function CoconetCallback(){
 }
 
 function SUNMASKOdeAll() {
-toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/coconet/coconet_sample_0.mid", function(dataUrl) {loadURLFile("Coconet_0.mid", dataUrl);
-                      //console.log('RESULT:', dataUrl);
-   });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/sunmask_ode/infill_sunmask_raw_0.mid", function(dataUrl) {loadURLFile("SUNMASK_infill_all_based_on_soprano.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/sunmask_ode/first_half_infill_sunmask_raw_0.mid", function(dataUrl) {loadURLFile("SUNMASK_infill_all_based_on_soprano_left_trust.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/sunmask_ode/first_half_infill_sunmask_replace_raw_0.mid", function(dataUrl) {loadURLFile("SUNMASK_infill_all_based_on_soprano_left_trust_replace_right.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/sunmask_ode/last_half_infill_sunmask_raw_0.mid", function(dataUrl) {loadURLFile("SUNMASK_infill_all_based_on_soprano_right_trust.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/sunmask_ode/last_half_infill_sunmask_replace_raw_0.mid", function(dataUrl) {loadURLFile("SUNMASK_infill_all_based_on_soprano_right_trust_replace_left.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/sunmask_ode/first_beat_infill_sunmask_raw_0.mid", function(dataUrl) {loadURLFile("SUNMASK_infill_all_based_on_soprano_first_beat_trust.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/sunmask_ode/first_beat_infill_sunmask_replace_raw_0.mid", function(dataUrl) {loadURLFile("SUNMASK_infill_all_based_on_soprano_first_beat_trust_replace_other_beats.mid", dataUrl); });
 };
 
 function SUNMASKOdeCallback(){
