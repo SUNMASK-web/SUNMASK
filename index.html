@@ -1,0 +1,370 @@
+<// minimalized version of a much nicer webpage from https://github.com/ct-martin/web-midi-player>
+<// https://github.com/mudcube/MIDI.js/pull/211>
+<script type="text/javascript" src="https://code.jquery.com/jquery-1.7.1.min.js"></script>
+<script src="js/inc/shim/Base64.js" type="text/javascript"></script>
+<script src="js/inc/shim/Base64binary.js" type="text/javascript"></script>
+<script src="js/inc/shim/WebAudioAPI.js" type="text/javascript"></script>
+<script src="js/inc/shim/WebMIDIAPI.js" type="text/javascript"></script>
+<script src="js/inc/jasmid/stream.js"></script>
+<script src="js/inc/jasmid/midifile.js"></script>
+<script src="js/inc/jasmid/replayer.js"></script>
+<script src="js/midi/audioDetect.js" type="text/javascript"></script>
+<script src="js/midi/gm.js" type="text/javascript"></script>
+<script src="js/midi/loader.js" type="text/javascript"></script>
+<script src="js/midi/plugin.audiotag.js" type="text/javascript"></script>
+<script src="js/midi/plugin.webaudio.js" type="text/javascript"></script>
+<script src="js/midi/plugin.webmidi.js" type="text/javascript"></script>
+<script src="js/midi/player.js" type="text/javascript"></script>
+<script src="js/midi/synesthesia.js" type="text/javascript"></script>
+<script src="js/util/dom_request_xhr.js" type="text/javascript"></script>
+<script src="js/util/dom_request_script.js" type="text/javascript"></script>
+
+<script>
+var playState = "init";
+var songs = {};
+var currentSong = "";
+
+function toDataURL(url, callback) {
+  var xhr = new XMLHttpRequest();
+  xhr.onload = function() {
+    var reader = new FileReader();
+    reader.onloadend = function() {
+      callback(reader.result);
+    }
+    reader.readAsDataURL(xhr.response);
+  };
+  xhr.open('GET', url);
+  xhr.responseType = 'blob';
+  xhr.send();
+}
+
+function SUNMASKtop20Button() {
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/top_20/download_sunmask_typical_True_raw_36.mid", function(dataUrl) {loadURLFile("SUNMASK_top20_36.mid", dataUrl);
+                      //console.log('RESULT:', dataUrl);
+   });
+};
+
+function Coconettop20Button() {
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/coconet/coconet_sample_0.mid", function(dataUrl) {loadURLFile("Coconet_0.mid", dataUrl);
+                      //console.log('RESULT:', dataUrl);
+   });
+};
+
+
+function loadURLFile(name, fURL) {
+    if(songs[escape(name)]) return;
+    songs[escape(name)] = fURL;
+    $("#playlist-list").append("<div class=\"playlist-list-item\" onclick=\"playSong('" + escape(name) + "')\"><span class=\"fa-play-circle\"></span> " + escape(name) + "</div>");
+};
+
+function loadLocalFile(f) {
+        console.log(f);
+        var reader = new FileReader();
+        reader.onload = (function(theFile) {
+            return function(e) {
+                if(songs[escape(theFile.name)]) return;
+                songs[escape(theFile.name)] = e.target.result;
+                $("#playlist-list").append("<div class=\"playlist-list-item\" onclick=\"playSong('" + escape(theFile.name) + "')\"><span class=\"fa-play-circle\"></span> " + escape(theFile.name) + "</div>");
+            };
+        })(f);
+        reader.readAsDataURL(f);
+};
+
+// File Uploading
+function handleFileSelect(evt) {
+    var files = evt.target.files; for (var i = 0, f; f = files[i]; i++) {
+        if (!(f.type.match('audio/midi') || f.type.match('audio/mid'))) {
+            console.log("Invalid: " + f.type);
+            alert("Only MIDI files are allowed");
+            continue;
+        }
+        loadLocalFile(f);
+    }
+}
+
+// Start a new song
+function playSong(name) {
+    MIDI.loadPlugin({
+        soundfontUrl: "https://gleitz.github.io/midi-js-soundfonts/FluidR3_GM/",
+		instrument: "acoustic_grand_piano",
+        onsuccess: function() {
+            for(var i = 0; i < 16; i++) {
+                if(i != 9)
+                    MIDI.programChange(i, 0);
+            };
+        }
+    });
+    document.getElementById('playfile').innerHTML = "Now playing: " + name
+    currentSong = name;
+	var startingPoint = MIDI.getContext().currentTime;
+
+	var vol1 = document.getElementById('slider1').value;
+	//var vol2 = document.getElementById('slider2').value;
+	//var vol3 = document.getElementById('slider3').value;
+	//var vol4 = document.getElementById('slider4').value;
+    
+	MIDI.setVolume(0, vol1, 0);
+	//MIDI.setVolume(1, vol2, 0);
+	//MIDI.setVolume(2, vol3, 0);
+	//MIDI.setVolume(3, vol4, 0);
+
+    // multiply by 2 to keep the slider bpm aligned
+	var bpm = 2 * document.getElementById('slider5').value;
+
+    document.getElementById('myPianoRollVisualizer').src = songs[name];
+    //document.getElementById('myStaffVisualizer').src = songs[name];
+    MIDI.Player.BPM = bpm;
+
+    document.getElementById('scrollbar').style.animation = "none";
+    document.getElementById('scrollbar').style.transitionTimingFunction = null;
+    document.getElementById('scrollbar').style.transitionDuration = null;
+    document.getElementById('scrollbar').style.left = 5 + "px";
+    //reflow
+    document.getElementById('myPianoRollVisualizer').offsetWidth;
+
+    MIDI.Player.loadFile(songs[name])
+    var dur = MIDI.Player.endTime / 1000;
+
+    //document.getElementById('scrollbar').style.transitionDuration = (w/pixPerSec) + "s"
+    //document.getElementById('scrollbar').style.animationTimingFunction = "linear";
+
+    document.getElementById('scrollbar').style.animation = "none";
+    document.getElementById('scrollbar').style.transitionTimingFunction = "linear ";
+    document.getElementById('scrollbar').style.transitionDuration = dur + "s"
+
+    //MIDI.Player.loadFile(songs[name], function() { currentSong = name; changeState("start") });
+	//for(var e = 0; e < MIDI.Player.data.length; e++)
+	//{
+	//	var currentEvent = MIDI.Player.data[e][0].event;
+    //  console.log(currentEvent);
+								
+		//if(currentEvent.subtype == "programChange") currentEvent.programNumber = 0;
+		//currentEvent.channel = 0;
+	//};
+    // default pixelsPerTimestep = 30
+    // approximately bpm invariant "duration"
+    var invar_dur = dur / (160 / bpm)
+    var invar_pix = invar_dur * 30 + 5
+    document.getElementById('scrollbar').style.left = invar_pix + "px";
+
+    changeState("start");
+}
+
+// Some stuff for cleaner play/pause
+function changeState(state) {
+    if(state == playState) {
+        return;
+    } else if(state == "start") {
+        playState = "play";
+
+        // this is a way to set the channel number
+        // this is also a way to set the program number
+		for(var e = 0; e < MIDI.Player.data.length; e++)
+		{
+			var currentEvent = MIDI.Player.data[e][0].event;
+									
+			if(currentEvent.subtype == "programChange") currentEvent.programNumber = 0;
+			currentEvent.channel = 0;
+		}
+
+		function clone(o) {
+			if (typeof o != 'object') return (o);
+			if (o == null) return (o);
+			var ret = (typeof o.length == 'number') ? [] : {};
+			for (var key in o) ret[key] = clone(o[key]);
+			return ret;
+		};
+					
+		MIDI.Player.replayer.getData = function() { return clone(MIDI.Player.data); }
+        MIDI.Player.start();
+
+        $("#play-btn").hide();
+        $("#pause-btn").show();
+    } else if(state == "end") {
+        playState = "stop";
+        $("#play-btn").show();
+        $("#pause-btn").hide();
+    } else if(state == "play") {
+        if(playState == "pause") {
+            MIDI.Player.resume();
+        } else {
+            if(currentSong == "") {
+                alert("Please select a song from the playlist");
+                return;
+            } else {
+                playSong(currentSong);
+            }
+        }
+        playState = "play";
+        $("#play-btn").hide();
+        $("#pause-btn").show();
+    } else if(state == "pause") {
+        playState = "pause";
+        MIDI.Player.pause();
+        $("#play-btn").show();
+        $("#pause-btn").hide();
+    }
+}
+
+// Start JS things when page ready
+$(document).ready( function() {
+    document.getElementById('files').addEventListener('change', handleFileSelect, false);
+    sliderChange1(90)
+    //sliderChange2(80)
+    //sliderChange3(80)
+    //sliderChange4(85)
+    sliderChange5(160)
+	document.getElementById('slider1').value = 90;
+	//document.getElementById('slider2').value = 80;
+	//document.getElementById('slider3').value = 80;
+	//document.getElementById('slider4').value = 85;
+	document.getElementById('slider5').value = 160;
+
+    // set to piano by default
+    MIDI.loadPlugin({
+        soundfontUrl: "https://gleitz.github.io/midi-js-soundfonts/FluidR3_GM/",
+		instrument: "acoustic_grand_piano",
+        onsuccess: function() {
+            for(var i = 0; i < 16; i++) {
+                if(i != 9)
+                    MIDI.programChange(i, 0);
+            };
+            var vol1 = document.getElementById('slider1').value;
+            //var vol2 = document.getElementById('slider2').value;
+            //var vol3 = document.getElementById('slider3').value;
+            //var vol4 = document.getElementById('slider4').value;
+            MIDI.setVolume(0, vol1, 0);
+            //MIDI.setVolume(1, vol2, 0);
+            //MIDI.setVolume(2, vol3, 0);
+            //MIDI.setVolume(3, vol4, 0);
+        }
+    });
+});
+
+function sliderChange1(val) {
+    document.getElementById('output1').innerHTML = val;
+}
+function sliderChange2(val) {
+    document.getElementById('output2').innerHTML = val;
+}
+function sliderChange3(val) {
+    document.getElementById('output3').innerHTML = val;
+}
+function sliderChange4(val) {
+    document.getElementById('output4').innerHTML = val;
+}
+function sliderChange5(val) {
+    document.getElementById('output5').innerHTML = val;
+}
+function loadSUNMASKtop20Playlist() {
+    SUNMASKtop20Button();
+}
+function loadCoconetPlaylist() {
+    Coconettop20Button();
+}
+function stopAudio() {
+    document.getElementById('scrollbar').style.animation = "none";
+    document.getElementById('scrollbar').style.transitionTimingFunction = null;
+    document.getElementById('scrollbar').style.transitionDuration = null;
+    document.getElementById('scrollbar').style.left = 5 + "px";
+    //reflow
+    document.getElementById('myPianoRollVisualizer').offsetWidth;
+    MIDI.Player.stop();
+}
+
+function startAudio() {
+    playSong(currentSong);
+}
+
+function clearPlaylist() {
+    //fake clear so we can see the songs, but dont actually full clear so we don't have to re-fect urls
+    document.getElementById('playlist-list').innerHTML = '<p id="playlist-list-empty"><i>Click the filename in the list below (once loaded) to start playing</i></p>';
+}
+
+
+</script>
+
+
+<div id="progress">
+<div id="scrollbar" class="vertical"></div>
+</div>
+<div id="viz" style="height:255px">
+<midi-visualizer type="piano-roll" id="myPianoRollVisualizer" 
+  src="">
+</midi-visualizer>
+
+<!midi-visualizer type="staff" id="myStaffVisualizer" 
+  src="https://cdn.jsdelivr.net/gh/cifkao/html-midi-player@2b12128/twinkle_twinkle.mid">
+<!/midi-visualizer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/combine/npm/tone@14.7.58,npm/@magenta/music@1.23.1/es6/core.js,npm/focus-visible@5,npm/html-midi-player@1.5.0"></script>
+
+<div style="height:20px"></div>
+<div>
+<button onclick="startAudio()">Play</button>
+<button onclick="stopAudio()">Stop</button>
+<div id="playfile" style="height:25px">Now playing: </div>
+</div>
+
+<div style="height:20px"></div>
+<div id="controls">
+    <div id="control-buttons">
+        <span id="play-btn" onclick="changeState('play')"></span>
+        <span id="pause-btn" onclick="changeState('pause')"></span>
+<output id="output1" style="display:inline-block"></output>
+       <input id="slider1" type="range" min="0" max="120" step="1" oninput="sliderChange1(this.value)">
+<!output id="output2" style="display:inline-block"></output>
+       <!input id="slider2" type="range" min="0" max="120" step="1" oninput="sliderChange2(this.value)">
+<!output id="output3" style="display:inline-block"></output>
+       <!input id="slider3" type="range" min="0" max="120" step="1" oninput="sliderChange3(this.value)">
+<!output id="output4" style="display:inline-block"></output>
+       <!input id="slider4" type="range" min="0" max="120" step="1" oninput="sliderChange4(this.value)">
+       <div style="display:inline-block">Volume controls (default 90)</div>
+    </div>
+    <div id="control-buttons">
+		<output id="output5" style="display:inline-block"></output>
+        <input id="slider5" type="range" min="80" max="240" step="5" oninput="sliderChange5(this.value)">
+        <div style="display:inline-block">Playback speed (default 160)</div>
+    </div>
+</div>
+<div style="height:20px"></div>
+<div id="playlist" class="panel">
+    <div class="container">
+        <button onclick="loadSUNMASKtop20Playlist()">Load SUNMASK Top 20 playlist</button>
+        <button onclick="loadCoconetPlaylist()">Load Coconet playlist</button>
+        <div style="display:inline-block;width:60px">     </div>
+        <button onclick="clearPlaylist()">Clear playlist</button>
+        <input type="file" id="files" name="files" multiple />
+        <div id="playlist-list">
+            <p id="playlist-list-empty"><i>Click the filename in the list below (once loaded) to start playing</i></p>
+        </div>
+    </div>
+</div>
+
+<style>
+div {
+    animation-timing-function: linear;
+}
+.vertical { 
+	--leftStart: 0%;
+	border-left: 1px solid gray; 
+	height: 235px; 
+	position: absolute;
+	left: var(--leftStart);
+} 
+.playlist-list-item {
+  text-decoration: none;
+  color: black;
+}
+.playlist-list-item:hover {
+  font-weight: 900;
+}
+
+visualizer.config = {
+  noteHeight: 4,
+  pixelsPerTimeStep: 30,
+  minPitch: 30
+};
+
+</style>
