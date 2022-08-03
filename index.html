@@ -277,8 +277,8 @@ function startAudio() {
 }
 
 function clearPlaylist() {
-    //fake clear so we can see the songs, but dont actually full clear so we don't have to re-fect urls
     document.getElementById('playlist-list').innerHTML = '<p id="playlist-list-empty"><i>Click the filename in the list below (once loaded) to start playing</i></p>';
+    songs = {};
 }
 
 
