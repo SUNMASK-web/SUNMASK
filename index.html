@@ -200,12 +200,12 @@ $(document).ready( function() {
     //sliderChange2(80)
     //sliderChange3(80)
     //sliderChange4(85)
-    sliderChange5(160)
+    sliderChange5(120)
 	document.getElementById('slider1').value = 90;
 	//document.getElementById('slider2').value = 80;
 	//document.getElementById('slider3').value = 80;
 	//document.getElementById('slider4').value = 85;
-	document.getElementById('slider5').value = 160;
+	document.getElementById('slider5').value = 120;
 
     // set to piano by default
     MIDI.loadPlugin({
@@ -341,6 +341,26 @@ function SUNMASKOdeCallback(){
    };
 }
 
+function BachExamplesAll() {
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/bach_examples/valid_raw_bwv162-6-lpz_64-192_101.mid", function(dataUrl) {loadURLFile("JSBach_bwv162-6.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/bach_examples/valid_raw_bwv111-6_128-256_16.mid", function(dataUrl) {loadURLFile("JSBach_bwv111-6.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/bach_examples/valid_raw_bwv13-6_0-128_42.mid", function(dataUrl) {loadURLFile("JSBach_bwv13-6.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/bach_examples/valid_raw_bwv347_0-128_535.mid", function(dataUrl) {loadURLFile("JSBach_bwv347.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/bach_examples/valid_raw_bwv55-5_0-128_761.mid", function(dataUrl) {loadURLFile("JSBach_bwv55-5.mid", dataUrl); });
+toDataURL("https://raw.githubusercontent.com/SUNMASK-web/SUNMASK/main/midis/bach_examples/valid_raw_bwv74-8_0-128_817.mid", function(dataUrl) {loadURLFile("JSBach_bwv74-8.mid", dataUrl); });
+};
+
+function BachCallback(){
+   var e = document.getElementById("BachDropdown");
+   var value = e.value;
+   var text = e.options[e.selectedIndex].text;
+   if (e.selectedIndex == 1){
+       BachExamplesAll();
+   } 
+    else {
+   };
+}
+
 
 function stopAudio() {
     document.getElementById('scrollbar').style.animation = "none";
@@ -405,7 +425,7 @@ function clearPlaylist() {
     <div id="control-buttons">
 		<output id="output5" style="display:inline-block"></output>
         <input id="slider5" type="range" min="80" max="240" step="5" oninput="sliderChange5(this.value)">
-        <div style="display:inline-block">Playback speed (default 160)</div>
+        <div style="display:inline-block">Playback speed (default 120)</div>
     </div>
 </div>
 <div style="height:20px"></div>
@@ -425,9 +445,13 @@ function clearPlaylist() {
             <option> -- Load SUNMASK Ode Infill Playlist -- </option>
             <option>SUNMASK Ode Infill (All)</option>
         </select>
+        <select id="BachDropdown", onchange="BachCallback();" onfocus="this.selectedIndex=-1;this.blur();">
+            <option> -- Load J.S. Bach example Playlist -- </option>
+            <option>Selections from J.S. Bach</option>
+        </select>
         <div style="display:inline-block;width:20px">     </div>
         <button onclick="clearPlaylist()">Clear playlist</button>
-        <input type="file" id="files" name="files" multiple />
+        <input type="file" id="files" name="files" style="display:none" multiple />
         <div id="playlist-list">
             <p id="playlist-list-empty"><i>Click the filename in the list below (once loaded) to start playing</i></p>
         </div>
