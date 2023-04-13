@@ -1,5 +1,5 @@
 # Overview
-We release different variations of the SUNMASK concept for learning and demonstration, though the current code release is not out of the box usable it should be useable to build on for future work.
+We release different variations of the SUNMASK concept for learning and demonstration, though the current code release is not out of the box usable it should be useful to build on for future work.
 
 # Demo / Learning About SUNMASK (Preferred)
 `demo` contains a simplified variation of SUNMASK, using a PerceiverAR style core model alongisde the masking and denoising objective. This should be generally usable and useful, althogh not directly comparable to Coconet or the published work due to the changes in the dataset processing and context conditioning of the model.
