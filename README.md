@@ -4,6 +4,7 @@ SUNMASK was presented at EvoMUSART 2023, slides can be viewed here [https://docs
 
 Code, see `code/README` for details on the various released code formats.
 
+For a summary overview of the hows and whys of iterative generators for discrete data (like text and symbolic music), check out the blog post on [Diffusion Language Models](https://sander.ai/2023/01/09/diffusion-language.html) by Sander Dieleman.
 
 
 To try the MIDI sample player as a demo, see [https://sunmask-web.github.io/SUNMASK/](https://sunmask-web.github.io/SUNMASK/)
