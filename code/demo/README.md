@@ -1,5 +1,5 @@
 Training:
-`CUDA_VISIBLE_DEVICES=1 python music_sunmask_prefix_train.py`
+`CUDA_VISIBLE_DEVICES=0 python music_sunmask_prefix_train.py`
 
 Sampling:
-`CUDA_VISIBLE_DEVICES=1 python music_sunmask_prefix_sample.py music_sunmask_prefix_models/music_sunmask_prefix_50000.pth music_sunmask_prefix_models/music_sunmask_prefix_metrics.npz`
+`CUDA_VISIBLE_DEVICES=0 python music_sunmask_prefix_sample.py music_sunmask_prefix_models/music_sunmask_prefix_50000.pth music_sunmask_prefix_models/music_sunmask_prefix_metrics.npz`
