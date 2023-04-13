@@ -1,0 +1,1554 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.functional as F
+import torch.utils.data
+import matplotlib.pyplot as plt
+import pandas as pd
+import shutil
+import mido
+import time
+import pretty_midi
+from midi2audio import FluidSynth
+from IPython.display import Audio, display
+import os
+
+device = 'cuda:0'
+softmax = torch.nn.functional.softmax
+
+base_dir = ''
+
+def play_midi(path):
+    if os.path.exists('test.wav'):
+        os.remove('test.wav')
+    FluidSynth('font.sf2').midi_to_audio(base_dir + path, 'test.wav')
+    audio = Audio('test.wav')
+    display(audio)
+
+data = np.load('Jsb16thSeparated.npz', encoding='bytes', allow_pickle=True)
+print(data.__dict__)
+
+# transpose chorales to different keys, so there's more variation in training data
+all_tracks = []
+for x in data.files:
+    for y in data[x]:
+        for i in range(-6, 6):
+            all_tracks.append(y + i)
+print(len(all_tracks))
+
+# determine highest and lowest pitches
+max_midi_pitch = -np.inf
+min_midi_pitch = np.inf
+for x in all_tracks:
+    if x.max() > max_midi_pitch:
+        max_midi_pitch = int(x.max())
+    if x.min() < min_midi_pitch:
+        min_midi_pitch = int(x.min())
+print(max_midi_pitch, min_midi_pitch)
+print(data.files)
+
+# now reset to only use training data
+# all_tracks = []
+#for x in [data.files[1]]:
+#    for y in data[x]:
+#        for i in range(-6, 6):
+#            all_tracks.append(y + i)
+#print(len(all_tracks))
+
+# now reset to only use training and valid data
+# do not early stop on validation, as the training and valid curves are too noisy
+all_tracks = []
+for x in [data.files[1], data.files[2]]:
+    for y in data[x]:
+        for i in range(-6, 6):
+            all_tracks.append(y + i)
+print(len(all_tracks))
+
+# set global variables
+I = 4 # number of voices
+T = 128 # length of samples (32 = two 4/4 measures)
+P = max_midi_pitch - min_midi_pitch + 1 # number of different pitches
+batch_size = 1
+hidden_size = 64
+# have to change normalization groups if this changes
+n_unrolled_steps = 2
+learning_rate = 0.0001
+# effective batch size is batch_size * n_unrolled_steps
+
+# THIS FLAG SKIPS TRAINING AND SAVING SO WE CAN EVAL A SAVED MODEL, LOADED LATER
+DO_TRAIN = False
+n_train_steps = 50000
+save_every = n_train_steps // 10
+show_every = max(1, n_train_steps // 1000)
+
+train_tracks = []
+
+for track in all_tracks:
+    track = track.transpose()
+    cut = 0
+    while cut < track.shape[1]-T:
+        if (track[:, cut:cut+T] > 0).all():
+            train_tracks.append(track[:, cut:cut+T] - min_midi_pitch)
+        cut += T
+train_tracks = np.array(train_tracks).astype(int)
+print(train_tracks.shape)
+
+# function for converting arrays of shape (T, 4) into midi files
+# the input array has entries that are np.nan (representing a rest)
+# or an integer between 0 and 127 inclusive
+from collections import OrderedDict
+
+def piano_roll_to_midi(piece, program_map_satb=[52, 52, 52, 52], velocity_map_satb=[70, 70, 70, 70], bpm=50):
+    """
+    piece is a an array of shape (T, 4) for some T.
+    The (i,j)th entry of the array is the midi pitch of the jth voice at time i. It's an integer in range(128).
+    outputs a mido object mid that you can convert to a midi file by called its .save() method
+    """
+    piece = np.concatenate([piece, [[np.nan, np.nan, np.nan, np.nan]]], axis=0)
+
+    microseconds_per_beat = 60 * 1000000 / bpm
+
+    mid = mido.MidiFile()
+    tracks = OrderedDict()
+    tracks["soprano"] = mido.MidiTrack()
+    tracks["alto"] = mido.MidiTrack()
+    tracks["tenor"] = mido.MidiTrack()
+    tracks["bass"] = mido.MidiTrack()
+
+    past_pitches = {'soprano': np.nan, 'alto': np.nan,
+                    'tenor': np.nan, 'bass': np.nan}
+    delta_time = {'soprano': 0, 'alto': 0, 'tenor': 0, 'bass': 0}
+
+    # create a track containing tempo data
+    metatrack = mido.MidiTrack()
+    metatrack.append(mido.MetaMessage('set_tempo',
+                                      tempo=int(microseconds_per_beat), time=0))
+    mid.tracks.append(metatrack)
+
+    # create the four voice tracks
+    for _i, voice in enumerate(tracks):
+        mid.tracks.append(tracks[voice])
+        tracks[voice].append(mido.Message(
+            'program_change', program=program_map_satb[_i], time=0))
+
+    # add notes to the four voice tracks
+    for i in range(len(piece)):
+        pitches = {'soprano': piece[i, 0], 'alto': piece[i, 1],
+                   'tenor': piece[i, 2], 'bass': piece[i, 3]}
+        for _j, voice in enumerate(tracks):
+            if np.isnan(past_pitches[voice]):
+                past_pitches[voice] = None
+            if np.isnan(pitches[voice]):
+                pitches[voice] = None
+            if pitches[voice] != past_pitches[voice]:
+                if past_pitches[voice]:
+                    tracks[voice].append(mido.Message('note_off', note=int(past_pitches[voice]),
+                                                      velocity=velocity_map_satb[_j], time=delta_time[voice]))
+                    delta_time[voice] = 0
+                if pitches[voice]:
+                    tracks[voice].append(mido.Message('note_on', note=int(pitches[voice]),
+                                                      velocity=velocity_map_satb[_j], time=delta_time[voice]))
+                    delta_time[voice] = 0
+            past_pitches[voice] = pitches[voice]
+            # 480 ticks per beat and each line of the array is a 16th note
+            delta_time[voice] += 120
+    return mid
+
+class Chorale:
+    """
+    A class to store and manipulate an array self.arr that stores a chorale.
+    """
+    def __init__(self, arr, subtract_30=False):
+        # arr is an array of shape (4, 32) with values in range(0, 57)
+        self.arr = arr.copy()
+        if subtract_30:
+            self.arr -= 30
+
+        # the one_hot representation of the array
+        reshaped = self.arr.reshape(-1)
+        self.one_hot = np.zeros((I*T, P))
+        r = np.arange(I*T)
+        self.one_hot[r, reshaped] = 1
+        self.one_hot = self.one_hot.reshape(I, T, P)
+
+    def play(self, filename='midi_track.mid', program_map_satb=[52, 52, 52, 52], velocity_map_satb=[70, 70, 70, 70], bpm=50):
+        # display an in-notebook widget for playing audio
+        # saves the midi file as a file named name in base_dir/midi_files
+        self.save(filename, program_map_satb, velocity_map_satb, bpm)
+        play_midi(filename)
+
+    def save(self, filename="download.mid", program_map_satb=[52, 52, 52, 52], velocity_map_satb=[70, 70, 70, 70], bpm=50):
+        midi_arr = self.arr.transpose().copy()
+        midi_arr += 30
+        midi = piano_roll_to_midi(midi_arr, program_map_satb, velocity_map_satb, bpm)
+        midi.save(filename)
+
+    def elaborate_on_voices(self, voices, model, n_unroll_steps=1, initial_corrupt=True, temperature=1.0, cfg_weight=3.0, seed=99, verbose=True):
+        # voice is a set consisting of 0, 1, 2, or 3
+        # create a mask consisting of the given voices
+        # generate a chorale with the same voices as in voices
+        mask = np.zeros((I, T))
+        rs = np.random.RandomState(seed)
+        y = rs.randint(P, size=(I, T))
+        for i in voices:
+            mask[i] = 1
+            y[i] = self.arr[i].copy()
+        return harmonize(y, mask, model, n_unroll_steps=n_unroll_steps, initial_corrupt=initial_corrupt, temperature=temperature,
+                         cfg_weight=cfg_weight, seed=rs.randint(10000), verbose=verbose)
+
+    def score(self):
+        consonance_dict = {0: 1, 1: 0, 2: 0, 3: 1, 4: 1, 5: 1, 6: 0, 7: 1, 8: 1, 9: 1, 10: 0, 11: 0}
+        consonance_score = 0
+        for k in range(32):
+            for i in range(4):
+                for j in range(i):
+                    consonance_score += consonance_dict[((self.arr[i, k] - self.arr[j, k]) % 12)]
+
+        note_score = 0
+        for i in range(4):
+            for j in range(1, 32):
+                if self.arr[i, j] != self.arr[i, j-1]:
+                    note_score += 1
+        return consonance_score, note_score
+
+    def to_image(self):
+        plt.style.use("seaborn-ticks")
+
+        # visualize the four tracks as individual images
+        soprano_oh = self.one_hot[0]
+        alto_oh = self.one_hot[1]
+        tenor_oh = self.one_hot[2]
+        bass_oh = self.one_hot[3]
+
+        soprano_m = soprano_oh.argmax(axis=-1) + 30
+        alto_m = alto_oh.argmax(axis=-1) + 30
+        tenor_m = tenor_oh.argmax(axis=-1) + 30
+        bass_m = bass_oh.argmax(axis=-1) + 30
+
+        soprano = np.zeros((T, P+30))
+        alto = np.zeros((T, P+30))
+        tenor = np.zeros((T, P+30))
+        bass = np.zeros((T, P+30))
+
+        r = np.arange(T)
+        soprano[r, soprano_m] = 1
+        alto[r, alto_m] = 1
+        tenor[r, tenor_m] = 1
+        bass[r, bass_m] = 1
+
+        soprano = soprano.transpose()
+        alto = alto.transpose()
+        tenor = tenor.transpose()
+        bass = bass.transpose()
+
+        fig, axs = plt.subplots(1, 4)
+        axs[0].imshow(soprano, cmap='Greys', interpolation='nearest')
+        axs[0].set_title('soprano')
+        axs[0].invert_yaxis()
+        axs[0].set_ylim(ymax=P+30, ymin=30)
+        axs[0].set_xlim(xmax=T, xmin=0)
+
+        axs[1].imshow(alto, cmap='Greys', interpolation='nearest')
+        axs[1].set_title('alto')
+        axs[1].invert_yaxis()
+        axs[1].set_ylim(ymax=P+30, ymin=30)
+        axs[1].set_xlim(xmax=T, xmin=0)
+
+
+        axs[2].imshow(tenor, cmap='Greys', interpolation='nearest')
+        axs[2].set_title('tenor')
+        axs[2].invert_yaxis()
+        axs[2].set_ylim(ymax=P+30, ymin=30)
+        axs[2].set_xlim(xmax=T, xmin=0)
+
+
+        axs[3].imshow(bass, cmap='Greys', interpolation='nearest')
+        axs[3].set_title('bass')
+        axs[3].invert_yaxis()
+        axs[3].set_ylim(ymax=P+30, ymin=30)
+        axs[3].set_xlim(xmax=T, xmin=0)
+
+
+        fig.set_figheight(5)
+        fig.set_figwidth(15)
+        return fig, axs
+
+    def to_image_combined(self):
+        chorale = self
+        midi = piano_roll_to_midi(chorale.arr.transpose().copy()+30)
+        if not os.path.exists(base_dir + 'midi_files'):
+            os.mkdir(base_dir + 'midi_files/')
+        midi.save(base_dir + 'midi_files/tmp_for_plot.mid')
+        midi_data = pretty_midi.PrettyMIDI(base_dir + 'midi_files/tmp_for_plot.mid')
+        total_length = midi_data.get_end_time()
+        plt.style.use("seaborn-ticks")
+        fig = plt.figure()
+        ax = plt.gca()
+        ax.set_ylim(ymax=P+30, ymin=30)
+
+        colors = [(189, 39, 25), #SATB
+                  (36, 88, 197),
+                  (228, 174, 74),
+                  (121, 165, 90),
+                ]
+
+        colors = [tuple([c/255 for c in color]) for color in colors]
+
+        part_names = ['soprano', 'alto', 'tenor', 'bass']
+        alpha = 0.8
+
+        for i in range(4):
+            note_list = midi_data.instruments[i].notes
+            color = colors[i]
+
+            for j in range(len(note_list)):
+                note = note_list[j]
+                pitch = note.pitch
+                on = note.start
+                off = note.end
+                if j==len(note_list)-1:
+                    ax.axhline(y=pitch, xmin=(on/total_length), xmax=(off/total_length),
+                               lw=4, color=color, alpha=alpha, solid_capstyle='butt', label=part_names[i])
+                else:
+                    ax.axhline(y=pitch, xmin=(on/total_length), xmax=(off/total_length),
+                               lw=4, color=color, alpha=alpha, solid_capstyle='butt')
+        ax.set_ylabel("Pitch")
+        # Shrink current axis's height by 10% on the bottom
+        box = ax.get_position()
+        ax.set_position([box.x0, box.y0 + box.height * 0.1,
+                        box.width, box.height * 0.9])
+
+        # Put a legend below current axis
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.1),
+                  fancybox=True, shadow=True, ncol=5)
+        ax.set_xticks(np.arange(0, 5+1) * 25)
+
+        return fig, ax
+
+def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-1E9):
+    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+        Args:
+            logits: logits distribution shape (..., vocabulary size)
+            top_k >0: keep only top k tokens with highest probability (top-k filtering).
+            top_p >0.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+    """
+    top_k = min(top_k, logits.size(-1))  # Safety check
+    if top_k > 0:
+        # Remove all tokens with a probability less than the last token of the top-k
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+
+    if top_p > 0.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+
+        cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove = sorted_indices_to_remove.long()
+
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1]
+        sorted_indices_to_remove[..., 0] = 0
+
+        sorted_indices = torch.tensor(sorted_indices.cpu().data.numpy())
+        shp = logits.shape
+        logits_red = logits.reshape((-1, shp[-1]))
+        sorted_indices_red = sorted_indices.reshape((-1, shp[-1]))
+        sorted_indices_to_remove_red = sorted_indices_to_remove.reshape((-1, shp[-1]))
+        for i in range(shp[0]):
+            logits_red[i][sorted_indices_red[i]] = logits_red[i][sorted_indices_red[i]] * (1. - sorted_indices_to_remove_red[i]) + sorted_indices_to_remove_red[i] * filter_value
+        logits = logits_red.reshape(shp)
+    return logits
+
+
+def typical_top_k_filtering(logits, top_k=0, top_p=0.0, temperature=1.0, min_tokens_to_keep=1, filter_value=-1E12):
+    """ Filter a distribution of logits using typicality, with optional top-k and/or nucleus (top-p) filtering
+        Meister et. al. https://arxiv.org/abs/2202.00666
+        Args:
+            logits: logits distribution shape (..., vocabulary size)
+            top_k >0: keep top k tokens with highest prob (top-k filtering).
+            top_p >0.0: keep the top p tokens which compose cumulative probability mass top_p (nucleus filtering).
+            min_tokens_to_keep >=1: always keep at least this many tokens through the top_p / nucleus sampling
+    """
+    # https://arxiv.org/abs/2202.00666
+    # based on hugging face impl but added top k
+    # https://github.com/cimeister/typical-sampling/commit/0f24c9409dc078ed23982197e8af1439093eedd3#diff-cde731a000ec723e7224c8aed4ffdedc9751f5599fe0a859c5c65d0c5d94891dR249
+    # changed some of the scatter logic to looping + stacking due to spooky threaded cuda errors, need to CUDA_NONBLOCKING=1 to fix
+
+    # typical decoding
+    scores = logits
+    mass = top_p if top_p > 0.0 else 1.0
+    # calculate entropy
+    log_p = torch.nn.functional.log_softmax(scores, dim=-1)
+    p = torch.exp(log_p)
+    ent = -(p * log_p).sum(-1, keepdim=True)
+    # shift and sort
+    # abs(I() - H())
+    # I() is -log(p()) from eq 5
+    # so overall we see -log(p()) - ent
+    # orig code was ((-ent) - log_p) 
+    shifted_scores = torch.abs(-log_p - ent)
+
+    # most typical (0) to least typical (high abs value)
+    _, sorted_indices = torch.sort(shifted_scores, descending=False, stable=True)
+    top_k = min(top_k, scores.size(-1) - 1)  # safety check that top k is not too large
+    if top_k > 0:
+        topkval = torch.topk(torch.max(shifted_scores) - shifted_scores, top_k)[0][..., -1, None]
+        indices_to_remove = (torch.max(shifted_scores) - shifted_scores) < topkval
+        scores[indices_to_remove] = filter_value
+
+    sorted_scores = scores.gather(-1, sorted_indices)
+    cumulative_probs = sorted_scores.softmax(dim=-1).cumsum(dim=-1)
+    # Remove tokens once cumulative probability above the threshold
+    sorted_indices_to_remove = cumulative_probs > mass
+    sorted_indices_to_remove = sorted_indices_to_remove.long()
+    if min_tokens_to_keep > 1:
+        # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
+        sorted_indices_to_remove[..., : min_tokens_to_keep - 1] = 0
+    # Shift the indices to the right to keep also the first token above the threshold
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = 0
+
+    sorted_indices = torch.tensor(sorted_indices.cpu().data.numpy())
+    shp = scores.shape
+    # not great cuda errors on gather calls here, rewrote to a "slow" version
+    scores_red = scores.reshape((-1, shp[-1]))
+    sorted_indices_red = sorted_indices.reshape((-1, shp[-1]))
+    sorted_indices_to_remove_red = sorted_indices_to_remove.reshape((-1, shp[-1]))
+    for i in range(shp[0]):
+        scores_red[i][sorted_indices_red[i]] = scores_red[i][sorted_indices_red[i]] * (1. - sorted_indices_to_remove_red[i]) + sorted_indices_to_remove_red[i] * filter_value
+    scores = scores_red.reshape(shp)
+    return scores
+
+# harmonize a melody
+def torch_infer(y, C, model,
+                         keep_mask=None,
+                         n_steps=I * T,
+                         n_reps_per_mask=1,
+                         n_reps_final_mask_dwell=0,
+                         sundae_keep_prob=0.33,
+                         initial_corrupt=True,
+                         intermediate_corrupt=False,
+                         frozen_mask=False,
+                         use_active_balance=False,
+                         top_k=0, top_p=0.0,
+                         use_typical_sampling=False,
+                         temperature=1.0, o_nade_eta=3./4, seed=12, verbose=True):
+    assert len(y.shape) >= 3
+    if len(y.shape) == 3:
+        assert y.shape[-1] != 1
+
+    model.eval()
+    rs = np.random.RandomState(seed)
+    trsg = torch.Generator(device=device)
+    trsg.manual_seed(seed)
+
+    def lcl_gumbel_sample(logits):
+        torch_noise = torch.rand(logits.shape, generator=trsg, device=device) * ((1 - 1E-5) - 1E-5) + 1E-5
+        maxes = torch.argmax(logits - torch.log(-torch.log(torch_noise)), axis=-1, keepdim=True)
+        return maxes
+
+    def lcl_get_random_pitches(shape, vocab_size):
+        random_pitch = torch.randint(low=0, high=vocab_size, size=shape, device=device, generator=trsg)
+        return random_pitch
+
+    with torch.no_grad():
+        x = torch.tensor(y).float().to(device)
+        C = torch.tensor(C).long().to(device)
+        if keep_mask is not None:
+            keep_C = torch.tensor(keep_mask).long().to(device)
+
+        C2 = torch.clone(C)
+        alpha_max = .999
+        alpha_min = .001
+        eta = o_nade_eta
+
+        x_cache = torch.clone(x)
+        if initial_corrupt:
+            x = lcl_get_random_pitches(x.shape, P).float()
+            x[C2==1] = x_cache[C2==1]
+            if keep_mask is not None:
+                x[keep_C==1] = x_cache[keep_C==1]
+
+        n_steps = max(1, int(n_steps))
+        if sundae_keep_prob == "triangular":
+            sundae_keep_tokens_per_step = [2 * x.shape[2] * min((t + 1) / float(n_steps), 1 - (t + 1) / float(n_steps))
+                                           for t in range(int(n_steps))] + [1.0 * x.shape[2] for t in range(int(n_reps_final_mask_dwell))]
+        else:
+            sundae_keep_tokens_per_step = [sundae_keep_prob * x.shape[2]
+                                          for t in range(int(n_steps))] + [1.0 * x.shape[2] for t in range(int(n_reps_final_mask_dwell))]
+
+
+        has_been_kept = 1. + 0. * x
+        has_been_kept_torch = torch.tensor(has_been_kept).to(device)
+
+        # might need to renormalize the kept matrix at some point...
+        sampled_binaries = None
+        for n in range(int(n_steps + n_reps_final_mask_dwell)):
+            k = int(sundae_keep_tokens_per_step[n])
+            if k == 0:
+                # skip zero keep scheduled steps to speed things up
+                # do it this way because very long schedules need small k values
+                # which necessarily causes 0 to be more frequent
+                continue
+            fwd_step = n
+            if n_reps_per_mask > 1:
+                # roll mask forward 
+                fwd_step = int(fwd_step + n_reps_per_mask)
+            p = np.maximum(alpha_min, alpha_max - fwd_step*(alpha_max-alpha_min)/(eta*int(n_steps)))
+            if not frozen_mask:
+                if n % n_reps_per_mask == 0:
+                    sampled_binaries = torch.bernoulli(1. - (0 * C + p), generator=trsg).long()
+                    C2 += sampled_binaries
+                if n > n_steps:
+                    # set final mask to all ones
+                    C2[:] = 1
+            C2[C==1] = 1
+            # convert to one-hot
+            x_e, C2_e = model.expand(x, C2, is_torch=True)
+            # passing true will noise things
+            logits_x = model(x_e, C2_e, intermediate_corrupt)
+
+            # dont predict just logits anymore
+            # top k top p gumbel
+            if use_typical_sampling:
+                logits_x = logits_x / float(temperature)
+                filtered_logits_x = typical_top_k_filtering(logits_x, top_k=top_k, top_p=top_p, temperature=float(temperature))
+            else:
+                logits_x = logits_x / float(temperature)
+                filtered_logits_x = top_k_top_p_filtering(logits_x, top_k=top_k, top_p=top_p)
+            x_new = lcl_gumbel_sample(filtered_logits_x).float()
+
+            p = has_been_kept_torch[:, :, :] / torch.sum(has_been_kept_torch[:, :, :], axis=2, keepdims=True)
+            r_p = 1. - p
+            r_p = r_p / torch.sum(r_p, axis=2, keepdims=True)
+
+            if k > 0:
+                shp = r_p.shape
+                assert len(shp) == 3
+                r_p = r_p.reshape(shp[0] * shp[1], shp[2])
+                if use_active_balance:
+                    keep_inds_torch = torch.multinomial(r_p, num_samples=k, replacement=False, generator=trsg)
+                else:
+                    keep_inds_torch = torch.multinomial(0. * r_p + 1. / float(shp[2]), num_samples=k, replacement=False, generator=trsg)
+
+                keep_inds_torch = keep_inds_torch.reshape(shp[0], shp[1], -1)
+
+                assert x_new.shape[-1] == 1
+
+                for _ii in range(x.shape[0]):
+                    for _jj in range(x.shape[1]):
+                        x[_ii, _jj, keep_inds_torch[_ii, _jj]] = x_new[_ii, _jj, keep_inds_torch[_ii, _jj], 0]
+                        has_been_kept_torch[_ii, _jj, keep_inds_torch[_ii, _jj]] += 1
+            else:
+                pass
+            x[C==1] = x_cache[C==1]
+            if keep_mask is not None:
+                x[keep_C==1] = x_cache[keep_C==1]
+
+            C2 = torch.clone(C)
+        return x
+
+# try out the Chorale class functionality with training samples
+track = train_tracks[18]
+chorale = Chorale(track)
+scores = chorale.score()
+chorale.to_image()
+#chorale.play()
+
+import math
+import torch as th
+import torch.nn as nn
+
+# based on diffusion code from OpenAI
+class CheckpointFunction(th.autograd.Function):
+    @staticmethod
+    def forward(ctx, run_function, length, *args):
+        ctx.run_function = run_function
+        ctx.input_tensors = list(args[:length])
+        ctx.input_params = list(args[length:])
+        with th.no_grad():
+            output_tensors = ctx.run_function(*ctx.input_tensors)
+        return output_tensors
+
+    @staticmethod
+    def backward(ctx, *output_grads):
+        ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
+        with th.enable_grad():
+            # Fixes a bug where the first op in run_function modifies the
+            # Tensor storage in place, which is not allowed for detach()'d
+            # Tensors.
+            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
+            output_tensors = ctx.run_function(*shallow_copies)
+        input_grads = th.autograd.grad(
+            output_tensors,
+            ctx.input_tensors + ctx.input_params,
+            output_grads,
+            allow_unused=True,
+        )
+        del ctx.input_tensors
+        del ctx.input_params
+        del output_tensors
+        return (None, None) + input_grads
+
+
+def checkpoint(func, inputs, params, flag):
+    """
+    Evaluate a function without caching intermediate activations, allowing for
+    reduced memory at the expense of extra compute in the backward pass.
+    :param func: the function to evaluate.
+    :param inputs: the argument sequence to pass to `func`.
+    :param params: a sequence of parameters `func` depends on but does not
+                   explicitly take as arguments.
+    :param flag: if False, disable gradient checkpointing.
+    """
+    if flag:
+        args = tuple(inputs) + tuple(params)
+        return CheckpointFunction.apply(func, len(inputs), *args)
+    else:
+        return func(*inputs)
+
+
+class SiLU(nn.Module):
+    def forward(self, x):
+        return x * th.sigmoid(x)
+
+
+class GroupNorm32(nn.GroupNorm):
+    def forward(self, x):
+        return super().forward(x.float()).type(x.dtype)
+
+
+def conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def linear(*args, **kwargs):
+    """
+    Create a linear module.
+    """
+    return nn.Linear(*args, **kwargs)
+
+
+def avg_pool_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D average pooling module.
+    """
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+def normalization(channels):
+    """
+    Make a standard normalization layer.
+    :param channels: number of input channels.
+    :return: an nn.Module for normalization.
+    """
+    return GroupNorm32(32, channels)
+
+
+class ResBlock(nn.Module):
+    """
+    A residual block that can optionally change the number of channels.
+    :param channels: the number of input channels.
+    :param emb_channels: the number of timestep embedding channels.
+    :param dropout: the rate of dropout.
+    :param out_channels: if specified, the number of out channels.
+    :param use_conv: if True and out_channels is specified, use a spatial
+        convolution instead of a smaller 1x1 convolution to change the
+        channels in the skip connection.
+    :param dims: determines if the signal is 1D, 2D, or 3D.
+    :param use_checkpoint: if True, use gradient checkpointing on this module.
+    """
+
+    def __init__(
+        self,
+        channels,
+        dropout,
+        out_channels=None,
+        use_conv=False,
+        use_scale_shift_norm=False,
+        kernel_size=3,
+        dims=2,
+        use_checkpoint=False,
+    ):
+        super(ResBlock, self).__init__()
+        self.channels = channels
+        self.dropout = dropout
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.use_checkpoint = use_checkpoint
+        self.use_scale_shift_norm = use_scale_shift_norm
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            SiLU(),
+            conv_nd(dims, channels, self.out_channels, kernel_size=kernel_size, padding="same"),
+        )
+        """
+        self.emb_layers = nn.Sequential(
+            SiLU(),
+            linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            ),
+        )
+        """
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            SiLU(),
+            nn.Dropout(p=dropout),
+            zero_module(
+                conv_nd(dims, self.out_channels, self.out_channels, kernel_size=kernel_size, padding="same")
+            ),
+        )
+
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = conv_nd(
+                dims, channels, self.out_channels, kernel_size=kernel_size, padding="same",
+            )
+        else:
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+
+    def forward(self, x):
+        """
+        Apply the block to a Tensor, conditioned on a timestep embedding.
+        :param x: an [N x C x ...] Tensor of features.
+        :return: an [N x C x ...] Tensor of outputs.
+        """
+        return checkpoint(
+            # list with single element because checkpoint splats internally
+            # nasty bug, revist this if other functions call checkpoint
+            self._forward, [x], self.parameters(), self.use_checkpoint
+        )
+
+    def _forward(self, x, extras=None):
+        if len(x.shape) < 4:
+            x = x[None]
+
+        h = self.in_layers(x)
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            #scale, shift = th.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) #* (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = self.out_layers(h)
+        return self.skip_connection(x) + h
+
+
+class AttentionBlock(nn.Module):
+    """
+    An attention block that allows spatial positions to attend to each other.
+    Originally ported from here, but adapted to the N-d case.
+    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
+    """
+
+    def __init__(self, channels, num_heads=1, use_checkpoint=False):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.use_checkpoint = use_checkpoint
+
+        self.norm = normalization(channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1)
+        self.attention = QKVAttention()
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x):
+        # nasty bug here with checkpoint because checkpoint splats internally
+        return checkpoint(self._forward, [x], self.parameters(), self.use_checkpoint)
+
+    def _forward(self, x):
+        if len(x.shape) < 4:
+            x = x[None]
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        qkv = qkv.reshape(b * self.num_heads, -1, qkv.shape[2])
+        h = self.attention(qkv)
+        h = h.reshape(b, -1, h.shape[-1])
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
+
+
+class QKVAttention(nn.Module):
+    """
+    A module which performs QKV attention.
+    """
+
+    def forward(self, qkv):
+        """
+        Apply QKV attention.
+        :param qkv: an [N x (C * 3) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x C x T] tensor after attention.
+        """
+        ch = qkv.shape[1] // 3
+        q, k, v = th.split(qkv, ch, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = th.einsum(
+            "bct,bcs->bts", q * scale, k * scale
+        )  # More stable with f16 than dividing afterwards
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        return th.einsum("bts,bcs->bct", weight, v)
+
+
+class Upsample1D(nn.Module):
+    """
+    An upsampling layer with an optional convolution.
+    :param channels: channels in the inputs and outputs.
+    :param use_conv: a bool determining if a convolution is applied.
+    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then
+                 upsampling occurs in the inner-two dimensions.
+    """
+
+    def __init__(self, channels, use_conv, dims=2):
+        super().__init__()
+        self.channels = channels
+        self.use_conv = use_conv
+        self.dims = dims
+        if use_conv:
+            self.conv = conv_nd(dims, channels, channels, kernel_size=(3, 1), padding="same")
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        if self.dims == 3:
+            x = torch.nn.functional.interpolate(
+                x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
+            )
+        else:
+            x = torch.nn.functional.interpolate(x, scale_factor=(2, 1), mode="nearest")
+        if self.use_conv:
+            x = self.conv(x)
+        return x
+
+
+class Downsample1D(nn.Module):
+    """
+    A downsampling layer with an optional convolution.
+    :param channels: channels in the inputs and outputs.
+    :param use_conv: a bool determining if a convolution is applied.
+    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then
+                 downsampling occurs in the inner-two dimensions.
+    """
+
+    def __init__(self, channels, use_conv, dims=2):
+        super().__init__()
+        self.channels = channels
+        self.use_conv = use_conv
+        self.dims = dims
+        stride = 2 if dims != 3 else (1, 2, 2)
+        if use_conv:
+            self.op = conv_nd(dims, channels, channels, kernel_size=(3, 1), stride=(2, 1), padding=(1, 0))
+        else:
+            self.op = avg_pool_nd(stride)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        return self.op(x)
+
+
+class MSequential(nn.Sequential):
+    """
+    A sequential module that passes timestep embeddings to the children that
+    support it as an extra input.
+    """
+    def forward(self, x):
+        for layer in self:
+            x = layer(x)
+        return x
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        use_checkpoint = False
+
+        self.input_blocks = nn.ModuleList()
+        in_channels = 2 * I
+        dims = 2
+        model_channels = hidden_size
+        input_block_chans = [model_channels]
+        ch = model_channels
+        ds = 1
+        channel_mult = (1, 1, 2, 4)
+        attention_resolutions = (4,)
+        num_heads = 1
+        num_heads_upsample = num_heads
+        conv_resample = True
+        use_scale_shift_norm = True
+        num_res_blocks = 3
+        dropout = 0.0
+        kernel_size = (4, P)
+        in_conv = conv_nd(dims, in_channels, model_channels, kernel_size=kernel_size, padding="same")
+
+        self.input_blocks.append(MSequential(in_conv,))
+        for level, mult in enumerate(channel_mult):
+            for _ in range(num_res_blocks):
+                layers = [
+                    ResBlock(
+                        ch,
+                        dropout,
+                        out_channels=mult * model_channels,
+                        dims=dims,
+                        kernel_size=kernel_size,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                ]
+                ch = mult * model_channels
+                if ds in attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            ch, use_checkpoint=use_checkpoint, num_heads=num_heads
+                        )
+                    )
+                self.input_blocks.append(MSequential(*layers))
+                input_block_chans.append(ch)
+            if level != len(channel_mult) - 1:
+                self.input_blocks.append(
+                    MSequential(Downsample1D(ch, conv_resample, dims=dims),)
+                )
+                input_block_chans.append(ch)
+                ds *= 2
+
+        self.middle_block = MSequential(
+            ResBlock(
+                ch,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                kernel_size=kernel_size,
+                use_scale_shift_norm=use_scale_shift_norm,
+            ),
+            AttentionBlock(ch, use_checkpoint=use_checkpoint, num_heads=num_heads),
+            ResBlock(
+                ch,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                kernel_size=kernel_size,
+                use_scale_shift_norm=use_scale_shift_norm,
+            ),
+        )
+
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(channel_mult))[::-1]:
+            for i in range(num_res_blocks + 1):
+                layers = [
+                    ResBlock(
+                        ch + input_block_chans.pop(),
+                        dropout,
+                        out_channels=model_channels * mult,
+                        dims=dims,
+                        kernel_size=kernel_size,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                ]
+                ch = model_channels * mult
+                if ds in attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            ch,
+                            use_checkpoint=use_checkpoint,
+                            num_heads=num_heads_upsample,
+                        )
+                    )
+                if level and i == num_res_blocks:
+                    layers.append(MSequential(Upsample1D(ch, conv_resample, dims=dims),))
+                    ds //= 2
+                self.output_blocks.append(MSequential(*layers))
+
+        self.out_normalization = normalization(ch)
+        self.conv_pitch_linear = nn.Conv2d(P, P, 1, padding=0)
+        self.conv_instrument_downproj = nn.Conv2d(hidden_size, I, 1, padding=0)
+        self.internal_seed = 112233
+        self.internal_np_random_state = np.random.RandomState(self.internal_seed)
+
+    def reset_random_state(self):
+        self.internal_np_random_state = np.random.RandomState(self.internal_seed)
+
+    def forward(self, x, C, noise_x_based_on_mask=False):
+        # x is a tensor of shape (N, I, T, P)
+        # C is a tensor of 0s and 1s of shape (N, I, T)
+        # returns a tensor of shape (N, I, T, P)
+        def lcl_get_random_pitches(shape, vocab_size, low=0):
+            random_pitch = torch.tensor(self.internal_np_random_state.randint(low=low, high=vocab_size, size=shape)).type(torch.LongTensor).to(device)
+            return random_pitch
+
+        def lcl_corrupt_pitch_mask(batch, mask, vocab_size):
+            reduced_batch = torch.max(batch, dim=-1)[1]
+            random_pitches = lcl_get_random_pitches(reduced_batch.shape, vocab_size)
+            one_hot_random_pitches = 0. * batch
+            one_hot_random_pitches.scatter_(-1, random_pitches[..., None], -1)
+            corrupted = (1 - mask[..., None]) * one_hot_random_pitches + (1 * mask[..., None]) * batch
+            return corrupted
+
+        # get the number of batches
+        N = x.shape[0]
+
+        # mask convention is set for 0 == drop (or noise) 1 == keep
+        # shape is N, I, T
+        tiled_X = lcl_corrupt_pitch_mask(x, C, P)
+        # make sure mask has trailing 1 before repeat     
+        tiled_C = C[..., None].repeat(1, 1, 1, P)
+
+        if noise_x_based_on_mask:
+            y = torch.cat((tiled_X, tiled_C), dim=1)
+        else:
+            y = torch.cat((x, tiled_C), dim=1)
+
+        hs = []
+        h = y.type(self.inner_dtype)
+        for module in self.input_blocks:
+            h = module(h)
+            hs.append(h)
+
+        h = self.middle_block(h)
+
+        for module in self.output_blocks:
+            cat_in = th.cat([h, hs.pop()], dim=1)
+            h = module(cat_in)
+        y = self.out_normalization(h)
+        y = torch.permute(y, (0, 3, 1, 2))
+        y = self.conv_pitch_linear(y)
+        y = torch.permute(y, (0, 2, 3, 1))
+        y = self.conv_instrument_downproj(y)
+        return y
+
+    def expand(self, y, C, is_torch=False):
+        # y is an array of shape (I, T) with integer entries in [0, P)
+        # C is an array of shape (I, T) consisting of 0s and 1s
+        # the entries of y away from the support of C should be considered 'unknown'
+        # x is shape (I, T, P) one-hot representation of y
+        if is_torch:
+            if len(y.shape) < 3:
+                raise ValueError("input y should be 3d (N C T) or 4d (N C T 1)")
+            if len(y.shape) == 4:
+                assert y.shape[-1] == 1
+                x = torch.nn.functional.one_hot(y[..., 0].long(), num_classes=P)
+            else:
+                x = torch.nn.functional.one_hot(y.long(), num_classes=P)
+            C2 = torch.clone(C)
+        else:
+            # TODO: fix this for batch size > 1
+            compressed = y.reshape(-1)
+            x = np.zeros((I*T, P))
+            r = np.arange(I*T)
+            x[r, compressed] = 1
+            x = x.reshape(I, T, P)
+
+            # prep x and C for the plugging into the model
+            x = torch.tensor(x).type(torch.FloatTensor).to(device)
+            x = x.view(1, I, T, P)
+            C2 = torch.tensor(C).type(torch.FloatTensor).view(1, I, T).to(device)
+        return x, C2
+
+    def convert_to_fp16(self):
+        """
+        Convert the torso of the model to float16.
+        """
+        self.input_blocks.apply(convert_module_to_f16)
+        self.middle_block.apply(convert_module_to_f16)
+        self.output_blocks.apply(convert_module_to_f16)
+
+    def convert_to_fp32(self):
+        """
+        Convert the torso of the model to float32.
+        """
+        self.input_blocks.apply(convert_module_to_f32)
+        self.middle_block.apply(convert_module_to_f32)
+        self.output_blocks.apply(convert_module_to_f32)
+
+    @property
+    def inner_dtype(self):
+        """
+        Get the dtype used by the torso of the model.
+        """
+        return next(self.input_blocks.parameters()).dtype
+
+    def pred(self, y, C, temperature=1.0, seed=100):
+        x, C2 = self.expand(y, C)
+        # plug x and C2 into the model
+        rs = np.random.RandomState(seed)
+        with torch.no_grad():
+            out = self.forward(x, C2).view(I, T, P).cpu().numpy()
+            out = out.transpose(2, 0, 1) # shape (P, I, T)
+            probs = np.exp(out / temperature) / np.exp(out / temperature).sum(axis=0) # shape (P, I, T)
+            cum_probs = np.cumsum(probs, axis=0) # shape (P, I, T)
+            u = rs.rand(I, T) # shape (I, T)
+            return np.argmax(cum_probs > u, axis=0)
+
+model = Net().to(device)
+
+def save_midi(model, melody, id_number, seed=77):
+    """
+    Generate an artificial chorale which has melody in the soprano line and a Bach-like harmonization in the other lines.
+    Save the result in a midi file named {id_number}midi.mid
+    """
+    rs = np.random.RandomState(seed)
+    y = rs.randint(P, size=(I, T))
+    y[0] = np.array(melody) - 30 # subtract 30 because 30 is the minimum midi_value
+    D0 = np.ones((1, T)).astype(int)
+    D1 = np.zeros((3, T)).astype(int)
+    D = np.concatenate([D0, D1], axis=0)
+    prediction = harmonize(y, D, model, seed=rs.randint(100000), verbose=False) + 30 # 30 back on before passing to piano_roll_to_midi
+    prediction = prediction.transpose().tolist()
+    prediction = np.array(prediction)
+    midi_output = piano_roll_to_midi(prediction)
+    midi_output.save(str(pad_number(id_number)) + 'midi.mid')
+
+goldberg_like_line = [67, 67, 67, 67, 67, 67, 67, 67, 71, 71, 71, 71, 71, 71, 71, 71,
+                      69, 69, 69, 69, 67, 67, 66, 66, 64, 64, 64, 64, 62, 62, 62, 62]
+
+goldberg_like_line_down = [37, 37, 37, 37, 37, 37, 37, 37, 41, 41, 41, 41, 41, 41, 41, 41,
+                           39, 39, 39, 39, 37, 37, 36, 36, 34, 34, 34, 34, 32, 32, 32, 32]
+
+soprano_probs = []
+alto_probs = []
+tenor_probs = []
+bass_probs = []
+
+# some helper functions for getting feedback data while training
+def pad_number(n):
+    """
+    prepare numbers for better file storage
+    """
+    if n == 0:
+        return '00000'
+    else:
+        digits = int(np.ceil(np.log10(n)))
+        pad_zeros = 5 - digits
+        return '0'*pad_zeros + str(n)
+
+def return_probs(y, C):
+    # TODO: fix this to use actual probs...
+    """
+    Plugs (y, C) into model and converts the (logprob) output to probabilities.
+    In other words, in the output, the (i,j,k)th entry is the probability of getting the kth pitch when you sample for the ith voice at time j.
+    """
+    compressed = y.reshape(-1)
+    x = np.zeros((I*T, P))
+    r = np.arange(I*T)
+    x[r, compressed] = 1
+    x = x.reshape(I, T, P)
+    x = torch.tensor(x).type(torch.FloatTensor).to(device)
+    x = x.view(1, I, T, P)
+    C2 = torch.tensor(C).type(torch.FloatTensor).to(device)
+    model.eval()
+    with torch.no_grad():
+        # passing True for blank mask cond noises
+        logits = model(x, C2, False).cpu().data.numpy()
+        out = logits[-1].reshape(I, T, P).transpose(2, 0, 1)
+        probs = np.exp(out)/np.sum(np.exp(out), axis=0)
+        return probs.transpose(1, 2, 0)
+
+def store_heatmaps(x, C):
+    """
+    The output of a inputting a single sample into the net is an array of shape (I, T, P) that is interpreted as log probabilities.
+    After normalizing to probabilities, it can be interpreted as four arrays (once for each voice soprano, alto, tenor, bass) of shape (T, P)
+    That consist of the probabilities of selecting given pitches for each voice at each time. These probabilities can be visualized in heatmaps,
+    and this function stores those four heatmaps in the arrays soprano_probs, alto_probs, tenor_probs, bass_probs.
+    """
+    model.eval()
+    with torch.no_grad():
+        probs = return_probs(x, C)
+        soprano_probs.append(probs[0].transpose())
+        alto_probs.append(probs[1].transpose())
+        tenor_probs.append(probs[2].transpose())
+        bass_probs.append(probs[3].transpose())
+
+def display_heatmaps():
+    """
+    Displays the latest heatmaps produced by store_heatmaps.
+    """
+    fig, axs = plt.subplots(1, 4)
+    axs[0].imshow(np.flip(soprano_probs[-1], axis=0), cmap='hot', interpolation='nearest')
+    axs[0].set_title('soprano')
+    axs[1].imshow(np.flip(alto_probs[-1], axis=0), cmap='hot', interpolation='nearest')
+    axs[1].set_title('alto')
+    axs[2].imshow(np.flip(tenor_probs[-1], axis=0), cmap='hot', interpolation='nearest')
+    axs[2].set_title('tenor')
+    axs[3].imshow(np.flip(bass_probs[-1], axis=0), cmap='hot', interpolation='nearest')
+    axs[3].set_title('bass')
+    fig.set_figheight(5)
+    fig.set_figwidth(15)
+    plt.show()
+
+import time
+print(time.time())
+
+from IPython.display import clear_output
+torch.cuda.empty_cache()
+model.train()
+
+_last_save = 0
+_last_show = 0
+_n_shown = 0
+_goldberg_mult = T // len(goldberg_like_line)
+_last_time = time.time()
+_save_time = 0
+
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+losses = []
+
+N = batch_size
+data_random_state = np.random.RandomState(2122)
+gumbel_sampling_random_state = np.random.RandomState(3434)
+corruption_sampling_random_state = np.random.RandomState(1122)
+
+def gumbel_sample(logits, temperature=1.):
+    noise = gumbel_sampling_random_state.uniform(1E-5, 1. - 1E-5, logits.shape)
+    torch_noise = torch.tensor(noise).contiguous().to(device)
+
+    # max indices
+    maxes = torch.argmax(logits / float(temperature) - torch.log(-torch.log(torch_noise)), axis=-1, keepdim=True)
+    one_hot = 0. * logits
+    one_hot.scatter_(-1, maxes, 1)
+    return one_hot
+
+def get_random_pitches(shape, vocab_size, low=0):
+    random_pitch = torch.tensor(corruption_sampling_random_state.randint(low=low, high=vocab_size, size=shape)).type(torch.LongTensor).to(device)
+    return random_pitch
+
+def corrupt_pitch_mask(batch, mask, vocab_size):
+    reduced_batch = torch.max(batch, dim=-1)[1]
+    random_pitches = get_random_pitches(reduced_batch.shape, vocab_size)
+    one_hot_random_pitches = 0. * batch
+    one_hot_random_pitches.scatter_(-1, random_pitches[..., None], 1)
+    corrupted = (1 - mask[..., None]) * one_hot_random_pitches + (1 * mask[..., None]) * batch
+    return corrupted
+
+def build_logits_fn(vocab_size, n_unrolled_steps, enable_sampling):
+    def logits_fn(input_batch, input_mask, input_noise_x_based_on_mask=False):
+        def fn(batch, mask, noise_x_based_on_mask=False):
+            logits = model(batch, mask, noise_x_based_on_mask)
+            return logits
+
+        def unroll_fn(batch, mask, noise_x_based_on_mask=False):
+            samples = corrupt_pitch_mask(batch, mask, vocab_size)
+            all_logits = []
+            for _ in range(n_unrolled_steps):
+                logits = fn(samples, mask, noise_x_based_on_mask)
+                samples = gumbel_sample(logits).detach()
+                # sanity check to avoid issues with stacked outputs
+                assert samples.shape[0] == batch.shape[0]
+                samples = samples[:batch.shape[0]]
+                all_logits += [logits[None]]
+            final_logits = torch.cat(all_logits, dim=0)
+            return final_logits
+
+        if enable_sampling:
+            return fn(input_batch, input_mask, input_noise_x_based_on_mask)
+        else:
+            return unroll_fn(input_batch, input_mask, input_noise_x_based_on_mask)
+    return logits_fn
+
+def build_loss_fn(vocab_size, n_unrolled_steps=4):
+    logits_fn = build_logits_fn(vocab_size, n_unrolled_steps, enable_sampling=False)
+
+    def local_loss_fn(batch, mask):
+        # repeated targets are now n_unrolled_steps
+        repeated_targets = torch.cat([batch] * n_unrolled_steps, dim=0)
+
+        # passing True noises
+        logits = logits_fn(batch, mask, False)
+        logits = logits.reshape(n_unrolled_steps * batch.shape[0], logits.shape[2], logits.shape[3], logits.shape[4])
+
+        raw_loss = -1. * (nn.functional.log_softmax(logits, dim=-1) * repeated_targets)
+        raw_masked_loss = raw_loss * torch.cat([(1. - mask[..., None])] * n_unrolled_steps, dim=0)
+        reduced_mask_active = torch.cat([1. / ((1. - mask).sum(dim=1).sum(dim=1) + 1)] * n_unrolled_steps, dim=0)
+
+        reduced_loss = reduced_mask_active * raw_masked_loss.view(n_unrolled_steps * N, I * T * P).mean(dim=1)
+        loss = torch.sum(reduced_loss)
+        loss = n_unrolled_steps * T * loss
+        return loss
+    return local_loss_fn
+
+u_loss_fn = build_loss_fn(P, n_unrolled_steps=n_unrolled_steps)
+for i in range(n_train_steps):
+    if not DO_TRAIN:
+        break
+    # mask drawn with random probability
+    C_prob = data_random_state.rand(N)
+    C_mask_base = data_random_state.rand(N, I, T)
+    C = 1 * (C_mask_base < C_prob[:, None, None])
+    C = (1. - C) # convert to 0 drop format
+    C = C.astype(np.int32)
+    # mask convention is set for 0 == drop (or noise) 1 == keep
+    # shape is N, I, T
+
+    # batch is an np array of shape (N, I, T), entries are integers in [0, P)
+    indices = data_random_state.choice(train_tracks.shape[0], size=N)
+    batch = train_tracks[indices]
+
+    # x is of shape (N, I, T, P)
+
+    batch = batch.reshape(N*I*T)
+    x = np.zeros((N*I*T, P))
+    r = np.arange(N*I*T)
+    x[r, batch] = 1
+    x = x.reshape(N, I, T, P)
+    x = torch.tensor(x).type(torch.FloatTensor).to(device)
+    C2 = torch.tensor(C).type(torch.FloatTensor).to(device)
+
+    loss = u_loss_fn(x, C2)
+
+    losses.append(loss.item())
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    if i == 0 or (i - _last_show) > show_every:
+        _new_time = time.time()
+        _last_show = i
+        _n_shown += 1
+        if _n_shown >= 5:
+            _n_shown = 0
+            clear_output(wait=True)
+            plt.plot(losses)
+            plt.figure()
+            plt.plot(losses[-5000:])
+        print(i)
+        print('loss: ', loss.item())
+        print('approx time (sec) per step (ignoring save time): ', ((_new_time - _last_time) - _save_time) / float(show_every))
+        print('approx time (sec) per step (including save time): ', ((_new_time - _last_time) / float(show_every)))
+
+        D0 = np.ones((1, T))
+        D1 = np.zeros((3, T))
+        D = np.concatenate([D0, D1], axis=0).astype(int)
+        y = np.random.randint(P, size=(I, T))
+        y[0, :] = np.array(_goldberg_mult * goldberg_like_line_down)
+        store_heatmaps(y, D)
+        display_heatmaps()
+        _last_time = time.time()
+        _save_time = 0
+        model.train()
+
+    if _last_save == 0 or (i - _last_save) > save_every or i == (n_train_steps - 1):
+        _last_save = i
+        _save_start = time.time()
+        save_midi(model, _goldberg_mult * goldberg_like_line, i)
+        torch.save(model.state_dict(), 'model_{}.pt'.format(i + 1))
+        np.savez("model_train_losses_{}.npz".format(n_train_steps), losses=losses)
+        _save_end = time.time()
+        _save_time += (_save_end - _save_start)
+        print('save time (sec): ', (_save_end - _save_start))
+        model.train()
+
+    # adjust learning rate    
+    if i % 5000 == 0:
+        for g in optimizer.param_groups:
+            g['lr'] *= .75
+
+save_mount_path = "sunmask_convolutional_jsb/"
+if not os.path.exists(save_mount_path):
+    os.mkdir(save_mount_path)
+if DO_TRAIN:
+    torch.save(model.state_dict(), save_mount_path + "model_{}sundaestep_{}trainstep.pth".format(n_unrolled_steps, n_train_steps))
+    np.savez(save_mount_path + "model_train_losses_{}sundaestep_{}trainstep.npz".format(n_unrolled_steps, n_train_steps), losses=losses)
+
+d = np.load(save_mount_path + "model_train_losses_{}sundaestep_{}trainstep.npz".format(n_unrolled_steps, n_train_steps))
+losses = d["losses"]
+model = Net().to(device)
+model.load_state_dict(torch.load(save_mount_path + "model_{}sundaestep_{}trainstep.pth".format(n_unrolled_steps, n_train_steps)))
+print("loaded {}".format(save_mount_path + "model_train_losses_{}sundaestep_{}trainstep.npz".format(n_unrolled_steps, n_train_steps)))
+
+plt.plot(losses)
+
+print(losses[-1])
+
+soprano_probs = []
+alto_probs = []
+tenor_probs = []
+bass_probs = []
+D0 = np.ones((1, T))
+D1 = np.zeros((3, T))
+D = np.concatenate([D0, D1], axis=0).astype(int)
+y = np.random.randint(P, size=(I, T))
+y[0, :] = np.array(_goldberg_mult * goldberg_like_line_down)
+store_heatmaps(y, D)
+display_heatmaps()
+
+import random
+
+def seed_everything(seed=1234):
+    random.seed(seed)
+    tseed = random.randint(1, 1E6)
+    tcseed = random.randint(1, 1E6)
+    npseed = random.randint(1, 1E6)
+    ospyseed = random.randint(1, 1E6)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.manual_seed(tseed)
+    torch.cuda.manual_seed_all(tcseed)
+    np.random.seed(npseed)
+    # cannot set these inside env
+    #torch.use_deterministic_algorithms(True)
+    #os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    #os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ['PYTHONHASHSEED'] = str(ospyseed)
+
+pytorch_total_params = sum(p.numel() for p in model.parameters())
+print(pytorch_total_params)
+
+import time
+from IPython.display import HTML, display, FileLink
+
+def sample_random(temperature=1.0,
+                  batch_size=1,
+                  n_steps=2.0 * I * T,
+                  n_reps_per_mask=1,
+                  n_reps_final_mask_dwell=0,
+                  o_nade_eta=0.75,
+                  sundae_keep_prob=0.33, top_k=0, top_p=0.0,
+                  use_typical_sampling=False,
+                  intermediate_corrupt=False,
+                  frozen_mask=False,
+                  use_evener=False, seed_offset=0):
+    core_state = np.random.RandomState(12765 + seed_offset)
+
+    melody_seed = core_state.randint(100000)
+    all_seed = core_state.randint(100000)
+    internal_seed = core_state.randint(100000)
+    harmonize_seed = core_state.randint(100000)
+
+    seed_everything(all_seed)
+    model.internal_np_random_state = np.random.RandomState(internal_seed)
+
+    D0 = np.zeros((1, T))
+    D1 = np.zeros((3, T))
+    D = np.concatenate([D0, D1], axis=0).astype(int)
+    y = core_state.randint(P, size=(batch_size, I, T))
+    D = np.concatenate([D[None] for i in range(batch_size)], axis=0)
+
+    last_time = time.time()
+    out = torch_infer(y, D, model,
+                               n_steps=n_steps,
+                               n_reps_per_mask=n_reps_per_mask,
+                               n_reps_final_mask_dwell=n_reps_final_mask_dwell,
+                               o_nade_eta=o_nade_eta, temperature=temperature,
+                               sundae_keep_prob=sundae_keep_prob,
+                               top_k=top_k,
+                               top_p=top_p,
+                               use_typical_sampling=use_typical_sampling,
+                               use_evener=use_evener,
+                               initial_corrupt=True,
+                               intermediate_corrupt=intermediate_corrupt,
+                               frozen_mask=frozen_mask,
+                               seed=melody_seed, verbose=False)
+    new_time = time.time()
+    print("sampled in {} s".format(new_time - last_time))
+    has_printed = False
+
+    for i in range(batch_size):
+        new_chorale = Chorale(out[i].long().cpu().data.numpy())
+        if batch_size > 1:
+            if i == 0:
+                print("Cowardly refusing to output inline images and wav due to batch > 1")
+        else:
+            new_chorale.to_image()
+            new_chorale.to_image_combined()
+        stub = "typical_True" if use_typical_sampling else "typical_False"
+        fname = "download_sunmask_{}_raw_{}.mid".format(stub, i)
+        # Simple piano
+        program_map_satb = [0] * 4
+        velocity_map_satb = [70, 50, 50, 65]
+        bpm = 90
+        new_chorale.save(fname, program_map_satb, velocity_map_satb, bpm)
+        if batch_size > 1:
+            pass
+        else:
+            new_chorale.play(fname, program_map_satb, velocity_map_satb, bpm)
+        fname = "download_sunmask_{}_voice_{}.mid".format(stub, i)
+        # Voices sound nice, but not in every soundfont package
+        program_map_satb = [52] * 4
+        velocity_map_satb = [70, 50, 50, 65]
+
+        bpm = 50
+        new_chorale.save(fname, program_map_satb, velocity_map_satb, bpm)
+        if batch_size > 1:
+            pass
+        else:
+            new_chorale.play(fname, program_map_satb, velocity_map_satb, bpm)
+        fname = "download_sunmask_{}_quartet_{}.mid".format(stub, i)
+        # Oboe, English horn, clarinet, bassoon, sounds better on timidity.
+        program_map_satb = [69, 70, 72, 71]
+        velocity_map_satb = [70, 50, 50, 65]
+
+        bpm = 50
+        new_chorale.save(fname, program_map_satb, velocity_map_satb, bpm)
+        if batch_size > 1:
+            pass
+        else:
+            new_chorale.play(fname, program_map_satb, velocity_map_satb, bpm)
+
+temperature_to_test = .6
+steps_to_test = 2 * I * T
+batch_size_to_test = 1
+n_reps_per_mask_to_test = 1
+n_reps_final_mask_dwell_to_test = 0
+keep_to_test = "triangular" #.33
+top_k_to_test = 3
+top_p_to_test = 0.0
+seed_offset_to_test = 7945
+typical_sampler_to_test = True
+evener_to_test = False
+intermediate_noise_to_test = False
+frozen_mask_to_test = False
+
+sample_random(temperature=temperature_to_test,
+              batch_size=batch_size_to_test,
+              n_steps=steps_to_test,
+              n_reps_per_mask=n_reps_per_mask_to_test,
+              n_reps_final_mask_dwell=n_reps_final_mask_dwell_to_test,
+              sundae_keep_prob=keep_to_test,
+              top_k=top_k_to_test,
+              top_p=top_p_to_test,
+              use_typical_sampling=typical_sampler_to_test,
+              intermediate_corrupt=intermediate_noise_to_test,
+              frozen_mask=frozen_mask_to_test,
+              use_evener=evener_to_test, seed_offset=seed_offset_to_test)
+
+# this will sample without typical sampling as a comparison
+sample_random(temperature=temperature_to_test,
+              batch_size=batch_size_to_test,
+              n_steps=steps_to_test,
+              n_reps_per_mask=n_reps_per_mask_to_test,
+              n_reps_final_mask_dwell=n_reps_final_mask_dwell_to_test,
+              sundae_keep_prob=keep_to_test,
+              top_k=top_k_to_test,
+              top_p=top_p_to_test,
+              swap_at_eta=swap_at_eta_to_test,
+              use_typical_sampling=False,
+              intermediate_corrupt=intermediate_noise_to_test,
+              frozen_mask=frozen_mask_to_test,
+              use_evener=evener_to_test, seed_offset=seed_offset_to_test)

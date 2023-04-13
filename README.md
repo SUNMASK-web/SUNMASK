@@ -1,7 +1,11 @@
 # SUNMASK
 
-To try the MIDI sample player, see [https://sunmask-web.github.io/SUNMASK/](https://sunmask-web.github.io/SUNMASK/)
+SUNMASK was presented at EvoMUSART 2023 [https://docs.google.com/presentation/d/1ne2jtwl3xVq9Vy3psoUF3qU3VKYYpBp3F-Mv_u_Xd5E/edit?usp=sharing](https://docs.google.com/presentation/d/1ne2jtwl3xVq9Vy3psoUF3qU3VKYYpBp3F-Mv_u_Xd5E/edit?usp=sharing)
 
+Code
+
+
+To try the MIDI sample player as a demo, see [https://sunmask-web.github.io/SUNMASK/](https://sunmask-web.github.io/SUNMASK/)
 
 
 There is a known outstanding bug with MIDIjs, regarding the player skipping the first note, and also skipping some note playback late in the file. We will try to correct this or switch to a different player in the future.

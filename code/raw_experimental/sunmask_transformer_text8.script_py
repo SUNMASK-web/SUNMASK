@@ -1,0 +1,1518 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.functional as F
+import torch.utils.data
+import matplotlib.pyplot as plt
+import pandas as pd
+import shutil
+import mido
+import time
+import pretty_midi
+from midi2audio import FluidSynth
+from IPython.display import Audio, display
+import os
+import zipfile
+
+device = 'cuda:0'
+softmax = torch.nn.functional.softmax
+
+base_dir = ''
+
+if not os.path.exists("text8.zip"):
+    shutil.copy2("datasets/text8.zip", ".")
+os.chdir(orig_dir)
+
+raw_file = os.path.expanduser("text8.zip")
+rawdata = zipfile.ZipFile(raw_file).read('text8').decode('utf-8')
+s = sorted(list(set(rawdata)))
+vocab_to_ind = {s[i]: i for i in range(len(s))}
+ind_to_vocab = {vocab_to_ind[k]: k for k in vocab_to_ind.keys()}
+
+# set global variables
+I = 1
+T = 64 # length of samples
+P = len(vocab_to_ind)
+batch_size = 20
+n_unrolled_steps = 2
+learning_rate = 5E-5
+min_learning_rate = 5E-6
+clip_grad = 3
+
+# THIS FLAG SKIPS TRAINING AND SAVING SO WE CAN EVAL A SAVED MODEL, LOADED LATER
+DO_TRAIN = False
+n_train_steps = 150000
+save_every = n_train_steps // 10
+show_every = max(1, n_train_steps // 1000)
+
+class HParams(object):
+    """
+    skeletonized HParams container
+    """
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __repr__(self):
+        #[:-1] to drop trailing ","
+        return "HParams(\n" + "\n".join([str(k).replace("'", "") + "=" + "{}".format(v) + "," for k, v in self.__dict__.items()])[:-1] + "\n)"
+
+hp = HParams(memory_len=0,
+             context_len=0,
+             embedding_dropout_keep_prob=1.0,
+             transformer_input_dim=512,
+             n_layers=16,
+             n_heads=8,
+             head_dim=64,
+             model_dim=512,
+             inner_dim=2048,
+             input_dropout_keep_prob=1.0,
+             attention_dropout_keep_prob=1.0,
+             inner_dropout_keep_prob=1.0,
+             hidden_dropout_keep_prob=1.0,
+             output_dropout_keep_prob=1.0,
+             use_device='cuda',
+             batch_size=batch_size,
+             max_sequence_length=T,
+             max_vocabulary_size=P,
+             random_seed=2122)
+
+
+def get_data():
+    train_data = rawdata[:90000000]
+    valid_data = rawdata[90000000:95000000]
+    test_data = rawdata[95000000:]
+
+    # Encode characters
+    train_data = np.array([vocab_to_ind[s] for s in train_data])
+    valid_data = np.array([vocab_to_ind[s] for s in valid_data])
+    test_data = np.array([vocab_to_ind[s] for s in test_data])
+
+    # Split into chunks
+    train_data = train_data[:T*(len(train_data)//T)]
+    train_data = train_data.reshape(-1, T)
+
+    # Split into chunks
+    valid_data = valid_data[:T*(len(valid_data)//T)]
+    valid_data = valid_data.reshape(-1, T)
+
+    # Split into chunks
+    test_data = test_data[:T*(len(test_data)//T)]
+    test_data = test_data.reshape(-1, T)
+    return train_data, valid_data, test_data
+
+train_data, valid_data, test_data = get_data()
+
+def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-1E9):
+    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+        Args:
+            logits: logits distribution shape (..., vocabulary size)
+            top_k >0: keep only top k tokens with highest probability (top-k filtering).
+            top_p >0.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+    """
+    top_k = min(top_k, logits.size(-1))  # Safety check
+    if top_k > 0:
+        # Remove all tokens with a probability less than the last token of the top-k
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+
+    if top_p > 0.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+
+        cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove = sorted_indices_to_remove.long()
+
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1]
+        sorted_indices_to_remove[..., 0] = 0
+
+        sorted_indices = torch.tensor(sorted_indices.cpu().data.numpy())
+        shp = logits.shape
+        logits_red = logits.reshape((-1, shp[-1]))
+        sorted_indices_red = sorted_indices.reshape((-1, shp[-1]))
+        sorted_indices_to_remove_red = sorted_indices_to_remove.reshape((-1, shp[-1]))
+        for i in range(shp[0]):
+            logits_red[i][sorted_indices_red[i]] = logits_red[i][sorted_indices_red[i]] * (1. - sorted_indices_to_remove_red[i]) + sorted_indices_to_remove_red[i] * filter_value
+        logits = logits_red.reshape(shp)
+    return logits
+
+
+def typical_top_k_filtering(logits, top_k=0, top_p=0.0, temperature=1.0, min_tokens_to_keep=1, filter_value=-1E12):
+    """ Filter a distribution of logits using typicality, with optional top-k and/or nucleus (top-p) filtering
+        Meister et. al. https://arxiv.org/abs/2202.00666
+        Args:
+            logits: logits distribution shape (..., vocabulary size)
+            top_k >0: keep top k tokens with highest prob (top-k filtering).
+            top_p >0.0: keep the top p tokens which compose cumulative probability mass top_p (nucleus filtering).
+            min_tokens_to_keep >=1: always keep at least this many tokens through the top_p / nucleus sampling
+    """
+    # https://arxiv.org/abs/2202.00666
+    # based on hugging face impl but added top k
+    # https://github.com/cimeister/typical-sampling/commit/0f24c9409dc078ed23982197e8af1439093eedd3#diff-cde731a000ec723e7224c8aed4ffdedc9751f5599fe0a859c5c65d0c5d94891dR249
+    # changed some of the scatter logic to looping + stacking due to spooky threaded cuda errors, need to CUDA_NONBLOCKING=1 to fix
+
+    # typical decoding
+    scores = logits
+    mass = top_p if top_p > 0.0 else 1.0
+    # calculate entropy
+    log_p = torch.nn.functional.log_softmax(scores, dim=-1)
+    p = torch.exp(log_p)
+    ent = -(p * log_p).sum(-1, keepdim=True)
+    # shift and sort
+    # abs(I() - H())
+    # I() is -log(p()) from eq 5
+    # so overall we see -log(p()) - ent
+    # orig code was ((-ent) - log_p) 
+    shifted_scores = torch.abs(-log_p - ent)
+
+    # most typical (0) to least typical (high abs value)
+    _, sorted_indices = torch.sort(shifted_scores, descending=False, stable=True)
+    top_k = min(top_k, scores.size(-1) - 1)  # safety check that top k is not too large
+    if top_k > 0:
+        topkval = torch.topk(torch.max(shifted_scores) - shifted_scores, top_k)[0][..., -1, None]
+        indices_to_remove = (torch.max(shifted_scores) - shifted_scores) < topkval
+        scores[indices_to_remove] = filter_value
+
+    sorted_scores = scores.gather(-1, sorted_indices)
+    cumulative_probs = sorted_scores.softmax(dim=-1).cumsum(dim=-1)
+    # Remove tokens once cumulative probability above the threshold
+    sorted_indices_to_remove = cumulative_probs > mass
+    sorted_indices_to_remove = sorted_indices_to_remove.long()
+    if min_tokens_to_keep > 1:
+        # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
+        sorted_indices_to_remove[..., : min_tokens_to_keep - 1] = 0
+    # Shift the indices to the right to keep also the first token above the threshold
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = 0
+
+    sorted_indices = torch.tensor(sorted_indices.cpu().data.numpy())
+    shp = scores.shape
+    # not great cuda errors on gather calls here, rewrote to a "slow" version
+    scores_red = scores.reshape((-1, shp[-1]))
+    sorted_indices_red = sorted_indices.reshape((-1, shp[-1]))
+    sorted_indices_to_remove_red = sorted_indices_to_remove.reshape((-1, shp[-1]))
+    for i in range(shp[0]):
+        scores_red[i][sorted_indices_red[i]] = scores_red[i][sorted_indices_red[i]] * (1. - sorted_indices_to_remove_red[i]) + sorted_indices_to_remove_red[i] * filter_value
+    scores = scores_red.reshape(shp)
+    return scores
+
+def torch_infer_transformer(y, C, model, n_steps=I * T, n_reps_per_mask=1,
+                      n_reps_final_mask_dwell=0,
+                      sundae_keep_prob=0.33,
+                      initial_corrupt=True,
+                      intermediate_corrupt=False,
+                      frozen_mask=False,
+                      use_active_balance=False,
+                      top_k=0, top_p=0.0,
+                      use_typical_sampling=False,
+                      temperature=1.0, o_nade_eta=3./4, seed=12, verbose=True):
+    model.eval()
+    rs = np.random.RandomState(seed)
+    trsg = torch.Generator(device=device)
+    trsg.manual_seed(seed)
+
+    def lcl_gumbel_sample(logits):
+        torch_noise = torch.rand(logits.shape, generator=trsg, device=device) * ((1 - 1E-5) - 1E-5) + 1E-5
+        maxes = torch.argmax(logits - torch.log(-torch.log(torch_noise)), axis=-1, keepdim=True)
+        return maxes
+
+    def lcl_get_random_pitches(shape, vocab_size):
+        random_pitch = torch.randint(low=0, high=vocab_size, size=shape, device=device, generator=trsg)
+        return random_pitch
+
+    with torch.no_grad():
+        x = torch.tensor(y).float().to(device)
+        C = torch.tensor(C).long().to(device)
+        C2 = torch.clone(C)
+        alpha_max = .999
+        alpha_min = .001
+        eta = o_nade_eta
+
+        x_cache = torch.clone(x)
+        if initial_corrupt:
+            x = lcl_get_random_pitches(x.shape, P).float()
+            x[C2==1] = x_cache[C2==1]
+
+        n_steps = max(1, int(n_steps))
+
+        if sundae_keep_prob == "triangular":
+            sundae_keep_tokens_per_step = [2 * x.shape[0] * min((t + 1) / float(n_steps), 1 - (t + 1) / float(n_steps))
+                                           for t in range(int(n_steps))] + [1.0 * x.shape[0] for t in range(int(n_reps_final_mask_dwell))]
+        else:
+            sundae_keep_tokens_per_step = [sundae_keep_prob * x.shape[0]
+                                          for t in range(int(n_steps))] + [1.0 * x.shape[0] for t in range(int(n_reps_final_mask_dwell))]
+
+        has_been_kept = 1. + 0. * x
+        has_been_kept_torch = torch.tensor(has_been_kept).to(device)
+        sampled_binaries = None
+        for n in range(int(n_steps + n_reps_final_mask_dwell)):
+                # do n_unroll_steps of resampling, randomly sampling masks during the procedure
+                fwd_step = n
+                if n_reps_per_mask > 1:
+                    # roll mask forward 
+                    fwd_step = int(fwd_step + n_reps_per_mask)
+                p = np.minimum(1.0, np.maximum(alpha_min, alpha_max - fwd_step*(alpha_max-alpha_min)/(eta*int(n_steps))))
+                if not frozen_mask:
+                    if n % n_reps_per_mask == 0:
+                        sampled_binaries = torch.bernoulli(1. - (0 * C + p), generator=trsg).long()
+                        C2 += sampled_binaries
+                    if n > n_steps:
+                       # set final mask to all ones
+                       C2[:] = 1
+                C2[C==1] = 1
+                # passing true will noise things
+                x_e = torch.clone(x)
+                C2_e = torch.clone(C2)
+
+                logits_x, _mems = model(x_e, C2_e, intermediate_corrupt)
+                # dont predict just logits anymore
+                # top k top p gumbel
+                if swap_at_eta:
+                    swap_flag = n < (eta * int(n_steps))
+                else:
+                    swap_flag = use_typical_sampling
+                if use_typical_sampling and swap_flag:
+                    logits_x = logits_x / float(temperature)
+                    filtered_logits_x = typical_top_k_filtering(logits_x, top_k=top_k, top_p=top_p, temperature=float(temperature))
+                else:
+                    logits_x = logits_x / float(temperature)
+                    filtered_logits_x = top_k_top_p_filtering(logits_x, top_k=top_k, top_p=top_p)
+                x_new = lcl_gumbel_sample(filtered_logits_x).float()
+
+                k = int(sundae_keep_tokens_per_step[n])
+                p = has_been_kept_torch[:, :, 0] / torch.sum(has_been_kept_torch[:, :, 0], axis=0, keepdims=True)
+                r_p = 1. - p
+                r_p = r_p / torch.sum(r_p, axis=0, keepdims=True)
+                # put batch at the front for this sampling
+                r_p = r_p.permute(1, 0)
+                if k > 0:
+                    shp = r_p.shape
+                    if use_active_balance:
+                        keep_inds_torch = torch.multinomial(r_p, num_samples=k, replacement=False, generator=trsg)
+                    else:
+                        keep_inds_torch = torch.multinomial(0. * r_p + 1. / float(shp[0]), num_samples=k, replacement=False, generator=trsg)
+
+                    for i in range(x.shape[1]):
+                        x[keep_inds_torch[i], i, :] = x_new[keep_inds_torch[i], i, :]
+                        has_been_kept_torch[keep_inds_torch[i], i, :] += 1
+                else:
+                    pass
+                x[C == 1] = x_cache[C==1]
+                C2 = torch.clone(C)
+        return x.cpu().data.numpy()
+
+import math
+import torch.nn.functional as F
+import torch.nn as nn
+import collections
+
+_device_default = "cuda"
+def get_device_default():
+    return _device_default
+
+def set_device_default(dd):
+    _device_default = dd
+
+_dtype_default = "float32"
+def get_dtype_default():
+    return _dtype_default
+
+def set_dtype_default(dt):
+    _dtype_default = dt
+
+
+class Embedding(torch.nn.Module):
+    def __init__(self,
+                 n_symbols,
+                 output_dim,
+                 random_state=None,
+                 scale=1.,
+                 dtype="default",
+                 device="default"):
+        """
+        Last dimension of indices tensor must be 1!!!!
+        """
+        super(Embedding, self).__init__()
+        if random_state is None:
+            raise ValueError("Must pass random_state argument to Embedding")
+
+        th_embed = torch.nn.Embedding(n_symbols, output_dim)
+        self.th_embed = th_embed
+
+    def forward(self,
+                indices):
+        ii = indices.long()
+        shp = ii.shape
+        nd = len(ii.shape)
+        if shp[-1] != 1:
+            if nd < 3:
+                print("Embedding input should have last dimension 1, inferring dimension to 1, from shape {} to {}".format(shp, tuple(list(shp) + [1])))
+                ii = ii[..., None]
+            else:
+                raise ValueError("Embedding layer input must have last dimension 1 for input size > 3D, got {}".format(shp))
+
+        shp = ii.shape
+        nd = len(shp)
+        # force 3d for consistency, then slice
+        lu = self.th_embed(ii[..., 0])
+        return lu, self.vectors
+
+
+class EmbeddingDropout(Embedding):
+    """
+    From ENAS
+    https://github.com/carpedm20/ENAS-pytorch/blob/master/models/shared_rnn.py
+    Class for dropping out embeddings by zero'ing out parameters in the
+    embedding matrix.
+    This is equivalent to dropping out particular words, e.g., in the sentence
+    'the quick brown fox jumps over the lazy dog', dropping out 'the' would
+    lead to the sentence '### quick brown fox jumps over ### lazy dog' (in the
+    embedding vector space).
+    See 'A Theoretically Grounded Application of Dropout in Recurrent Neural
+    Networks', (Gal and Ghahramani, 2016).
+    """
+    def __init__(self,
+                 n_symbols,
+                 output_dim,
+                 dropout_keep_prob=1.,
+                 dropout_scale="default",
+                 random_state=None,
+                 scale=1.,
+                 dtype="default",
+                 device="default"):
+        """Embedding constructor.
+        Args:
+            dropout_keep_prob: Dropout probability.
+            dropout_scale: Used to scale parameters of embedding weight matrix that are
+                not dropped out. Note that this is _in addition_ to the
+                `1/dropout_keep_prob scaling.
+        See `Embedding` for remaining arguments.
+        """
+        Embedding.__init__(self,
+                           n_symbols=n_symbols,
+                           output_dim=output_dim,
+                           random_state=random_state,
+                           scale=scale,
+                           dtype=dtype,
+                           device=device)
+        self.g = torch.Generator(device=device)
+        self.g.manual_seed(random_state.randint(100000))
+        self.device = device
+
+        self.dropout_keep_prob = dropout_keep_prob
+        if dropout_scale == "default":
+            dropout_scale = output_dim ** 0.5
+        self.dropout_scale = dropout_scale
+
+    def forward(self, indices):
+        """Embeds `indices` with the dropped out embedding weight matrix."""
+
+        if self.training:
+            dropout_keep_prob = self.dropout_keep_prob
+        else:
+            dropout_keep_prob = 1.
+
+        if dropout_keep_prob != 1.:
+            mask = self.th_embed.weight.data.new(self.th_embed.weight.size(0), 1)
+            mask.bernoulli_(dropout_keep_prob, generator=self.g)
+            mask = mask.expand_as(self.th_embed.weight)
+            mask = mask / (dropout_keep_prob)
+            masked_weight = self.th_embed.weight * torch.Tensor(mask)
+        else:
+            masked_weight = self.th_embed.weight
+
+        if self.dropout_scale and self.dropout_scale != 1.:
+            masked_weight = masked_weight * self.dropout_scale
+
+        ii = indices.long()
+        shp = ii.shape
+        nd = len(ii.shape)
+        if shp[-1] != 1:
+            if nd < 3:
+                print("Embedding input should have last dimension 1, inferring dimension to 1, from shape {} to {}".format(shp, tuple(list(shp) + [1])))
+                ii = ii[..., None]
+            else:
+                raise ValueError("Embedding layer input must have last dimension 1 for input size > 3D, got {}".format(shp))
+
+        shp = ii.shape
+        nd = len(shp)
+        # force 3d for consistency, then slice
+        lu = F.embedding(ii[..., 0], masked_weight)
+        return lu, masked_weight
+
+
+class Dropout(nn.Module):
+    def __init__(self, dropout_keep_prob=1.,
+                 random_state=None,
+                 dtype="default",
+                 device="default"):
+        super(Dropout, self).__init__()
+        self.dropout = 1. - dropout_keep_prob
+        if random_state is None:
+            raise ValueError("Must pass random_state to LockedDropout")
+        if device == "default":
+            raise ValueError("Must pass device argument")
+        device = torch.device(device)
+        self.g = torch.Generator(device=device)
+        self.g.manual_seed(random_state.randint(100000))
+        self.device = device
+
+    def forward(self, x):
+        if not self.training or self.dropout == 0.:
+            return x
+
+        pm = x.data.new(*x.size()).zero_()
+        pm = 0. * pm + (1. - self.dropout)
+        m = torch.bernoulli(pm, generator=self.g)
+        mask = torch.tensor(m, requires_grad=False) / (1. - self.dropout)
+        mask = mask.expand_as(x)
+        return mask * x
+
+
+class LockedDropout(nn.Module):
+    def __init__(self, dropout_keep_prob=1.,
+                 random_state=None,
+                 dtype="default",
+                 device="default"):
+        super(LockedDropout, self).__init__()
+        self.dropout = 1. - dropout_keep_prob
+        if random_state is None:
+            raise ValueError("Must pass random_state to LockedDropout")
+        if device == "default":
+            raise ValueError("Must pass device argument")
+        device = torch.device(device)
+        self.g = torch.Generator(device=device)
+        self.g.manual_seed(random_state.randint(100000))
+        self.device = device
+
+    def forward(self, x):
+        if not self.training or self.dropout == 0.:
+            return x
+        pm = x.data.new(1, *x.size()[1:]).zero_()
+        pm = 0. * pm + (1. - self.dropout)
+        m = torch.bernoulli(pm, generator=self.g)
+        mask = torch.tensor(m, requires_grad=False) / (1. - self.dropout)
+        mask = mask.expand_as(x)
+        return mask * x
+
+
+class PositionalEmbedding(nn.Module):
+    # credit to transformer xl
+    def __init__(self, embedding_dimension,
+                 dtype="default",
+                 device="default"):
+        super(PositionalEmbedding, self).__init__()
+
+        self.embedding_dimension = embedding_dimension
+        d = embedding_dimension
+
+        inv_freq = 1. / (10000. ** (torch.arange(0.0, self.embedding_dimension, 2.0) / float(self.embedding_dimension)))
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, position_sequence, batch_size=None):
+        sinusoid_inp = torch.ger(position_sequence.float(), self.inv_freq)
+        pos_emb = torch.cat([torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)], dim=-1)
+
+        if batch_size is not None:
+            return pos_emb[:, None, :].expand(-1, batch_size, -1)
+        else:
+            return pos_emb[:, None, :]
+
+
+class LayerNorm(torch.nn.Module):
+    """
+    https://nlp.seas.harvard.edu/2018/04/03/attention.html
+    """
+    def __init__(self,
+                 input_dim,
+                 eps=1E-6,
+                 dtype="default",
+                 device="default"):
+        super(LayerNorm, self).__init__()
+        self.input_dim = input_dim
+        self.a_2 = nn.Parameter(torch.ones(input_dim))
+        self.b_2 = nn.Parameter(torch.zeros(input_dim))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        # eps trick wont work here - std has issues if every element is 0 on that axis
+        # std = x.std(-1, keepdim=True)
+        # want to use sqrt of var + eps instead
+        var = x.var(-1, keepdim=True)
+        return self.a_2 * (x - mean) / torch.sqrt(var + self.eps) + self.b_2
+
+
+class PositionwiseFeedforward(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 projection_dim,
+                 dropout_keep_prob=1.0,
+                 random_state=None,
+                 device="default",
+                 dtype="default"):
+        super(PositionwiseFeedforward, self).__init__()
+
+        if random_state is None:
+            raise ValueError("Must pass random_state to PositionwiseFeedforward")
+
+        self.i = nn.Linear(input_dim,
+                           projection_dim,
+                           bias=True,
+                           device=device,
+                           dtype=dtype)
+
+        self.o = nn.Linear(projection_dim,
+                           input_dim,
+                           bias=True,
+                           device=device,
+                           dtype=dtype)
+
+        self.ln = LayerNorm(input_dim,
+                            device=device,
+                            dtype=dtype)
+
+        self.ld1 = LockedDropout(dropout_keep_prob=dropout_keep_prob,
+                                 device=device,
+                                 random_state=random_state)
+        self.ld2 = LockedDropout(dropout_keep_prob=dropout_keep_prob,
+                                 device=device,
+                                 random_state=random_state)
+
+    def forward(self, inp):
+        s1 = F.relu(self.i(inp))
+        ds1 = self.ld1(s1)
+
+        s2 = self.o(ds1)
+        ds2 = self.ld2(s2)
+        return self.ln(ds2 + inp)
+
+
+def _rel_shift(x, klen=-1):
+    x_padded = x.reshape(x.size(1), x.size(0), *x.size()[2:])
+    x = x_padded[1:].reshape(x.size(0), x.size(1) - 1, *x.size()[2:])
+    if klen != -1:
+        x = x[:, :klen, :, :]
+    return x
+
+
+class RelativeMultiHeadAttention(nn.Module):
+     def __init__(self, input_dim,
+                  n_heads=10, head_dim=38, model_dim=380,
+                  attention_dropout_keep_prob=1.0,
+                  random_state=None,
+                  device="default",
+                  dtype="default"):
+         super(RelativeMultiHeadAttention, self).__init__()
+
+         if random_state is None:
+             raise ValueError("Must pass random_state to RelativeMultiHeadAttention")
+
+         self.n_heads = n_heads
+         self.head_dim = head_dim
+         self.model_dim = model_dim
+         self.attention_dropout_keep_prob = attention_dropout_keep_prob
+
+         self.drop = nn.Dropout(1. - attention_dropout_keep_prob)
+         self.locked_drop = LockedDropout(attention_dropout_keep_prob, random_state=random_state, device=device)
+
+         # no biases in transformer XL code
+         self.qkv_net = nn.Linear(input_dim,
+                                  3 * n_heads * head_dim,
+                                  bias=False,
+                                  device=device,
+                                  dtype=dtype)
+
+         self.o_net = nn.Linear(head_dim * n_heads,
+                                model_dim,
+                                bias=False,
+                                device=device,
+                                dtype=dtype)
+
+         self.ln = LayerNorm(model_dim,
+                             device=device,
+                             dtype=dtype)
+         self.scale = 1. / (head_dim ** .5)
+
+     def forward(self, input, relative_positional_embedding, local_bias_ac, local_bias_bd, attention_mask=None, memory=None):
+         i = input
+         r = relative_positional_embedding
+         qlen = i.size(0)
+         rlen = r.size(0)
+         batch_size = i.size(1)
+         if memory is not None:
+             i_heads = self.qkv_net(torch.cat([memory, i], 0))
+         else:
+             i_heads = self.qkv_net(i)
+
+         r_heads = self.qkv_net(r)
+         i_head_q, i_head_k, i_head_v = torch.chunk(i_heads, 3, dim=-1)
+         r_head_q, r_head_k, r_head_v = torch.chunk(r_heads, 3, dim=-1)
+         if memory is not None:
+             # slice out the memory part for query
+             i_head_q = i_head_q[-qlen:]
+         klen = i_head_k.size(0)
+         i_head_q = i_head_q.view(qlen, batch_size, self.n_heads, self.head_dim)
+         # this could be much longer
+         i_head_k = i_head_k.view(klen, batch_size, self.n_heads, self.head_dim)
+         i_head_v = i_head_v.view(klen, batch_size, self.n_heads, self.head_dim)
+
+         r_head_q = r_head_q.view(rlen, batch_size, self.n_heads, self.head_dim)
+         r_head_k = r_head_k.view(rlen, batch_size, self.n_heads, self.head_dim)
+
+         # attention
+         # [qlen x bsz x n_head x d_head]
+         ir_head_q = i_head_q + local_bias_ac #+ r_head_q[-1] # bias term from pos embed
+         # [klen x bsz x n_head x d_head]
+         # i_head_k
+         # [qlen x klen x bsz x n_head]
+         AC = torch.einsum('ibnd,jbnd->ijbn', (ir_head_q, i_head_k))
+
+         ir2_head_q = i_head_q + local_bias_bd # bias term
+         BD = torch.einsum('ibnd,jbnd->ijbn', (ir2_head_q, r_head_k))
+         # rel shift effectively removes 1 along the 1st dim
+         BD = _rel_shift(BD)
+         attention_score = AC + BD
+         # [qlen x klen x bsz x n_head]
+         attention_score *= self.scale
+
+         #need to find and do something about rows with all masked
+         if attention_mask is not None and attention_mask.any().item():
+             # fill 1s with neg ing, leave 0s alone!
+             if attention_mask.dim() == 2:
+                 attention_score.masked_fill_(attention_mask[None, :, :, None], -float('inf'))
+             # can define either 2d or 3d mask here, but will need to be very careful about what is 0 and what is 1
+             elif attention_mask.dim() == 3:
+                 row_mask = (attention_mask.sum(axis=1) == attention_mask.shape[1])
+                 attention_score.masked_fill_(attention_mask[:, :, :, None], -float('inf'))
+                 if row_mask.sum() > 0:
+                     attention_score.masked_fill_(row_mask[:, None, :, None], -1E9)
+             else:
+                 raise ValueError("Attention_mask dim not handled in relative multihead attention!")
+
+         faker = 0. * attention_score + 1.
+         faker_mask = self.drop(faker)
+         # find rows with all -inf
+         # can't fill with neginf since could all be 0 - hence all neginf, leading to nan in softmax
+         attention_score.masked_fill_(faker_mask == 0, -1E9)
+         attention_prob = F.softmax(attention_score, dim=1)
+
+         # technically it's not a prob distribution if I force a completely blanked out row to be all 0
+
+         # as for dropout, this is how it is done in the PTB code but... not normalized anymore!
+         # question is, will other method freak out at test time? whereas this is more "normal" - basically same as dropping pieces of i_head_v
+         #attention_prob = self.drop(attention_prob)
+         # isn't this just dropout on the thing you are attending, in disguise?
+         # https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/layers/common_attention.py#L1822
+
+         attention_weighted_values = torch.einsum('ijbn,jbnd->ibnd', (attention_prob, i_head_v))
+
+         # [qlen x bsz x n_head x d_head]
+         attention_weighted_values = attention_weighted_values.contiguous().view(
+                attention_weighted_values.size(0),
+                attention_weighted_values.size(1),
+                self.n_heads * self.head_dim)
+
+         o = self.o_net(attention_weighted_values)
+         o = self.locked_drop(o)
+
+         output = self.ln(i + o)
+         return output
+
+class RelativeDecoderLayer(nn.Module):
+    def __init__(self, input_dim,
+                 n_heads=10,
+                 head_dim=38,
+                 model_dim=380,
+                 inner_dim=900,
+                 attention_dropout_keep_prob=0.8,
+                 inner_dropout_keep_prob=0.8,
+                 random_state=None,
+                 device="default",
+                 dtype="default"):
+        super(RelativeDecoderLayer, self).__init__()
+
+        if random_state is None:
+            raise ValueError("Must pass random_state to RelativeDecoderLayer")
+
+        self.attention = RelativeMultiHeadAttention(input_dim,
+                                                    n_heads=n_heads,
+                                                    head_dim=head_dim,
+                                                    model_dim=model_dim,
+                                                    attention_dropout_keep_prob=attention_dropout_keep_prob,
+                                                    random_state=random_state,
+                                                    device=device,
+                                                    dtype=dtype)
+
+        self.position_ff = PositionwiseFeedforward(input_dim,
+                                                   inner_dim,
+                                                   dropout_keep_prob=inner_dropout_keep_prob,
+                                                   random_state=random_state,
+                                                   device=device,
+                                                   dtype=dtype)
+
+    def forward(self, decoder_input, relative_positional_embedding, local_bias_ac, local_bias_bd, decoder_attention_mask=None, memory=None):
+        output = self.attention(decoder_input, relative_positional_embedding,
+                                local_bias_ac=local_bias_ac,
+                                local_bias_bd=local_bias_bd,
+                                attention_mask=decoder_attention_mask,
+                                memory=memory)
+        output = self.position_ff(output)
+        return output
+
+
+class AWDTransformerXLBaseBlock(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 remove_context=False,
+                 n_layers=16, n_heads=10, head_dim=38, model_dim=380, inner_dim=900,
+                 input_dropout_keep_prob=0.4,
+                 attention_dropout_keep_prob=0.8,
+                 inner_dropout_keep_prob=0.8,
+                 hidden_dropout_keep_prob=1.0,
+                 output_dropout_keep_prob=0.5,
+                 random_state=None,
+                 memory_len=0,
+                 context_len=0,
+                 scale="default",
+                 device="default",
+                 dtype="default"):
+        super(AWDTransformerXLBaseBlock, self).__init__()
+
+        self.remove_context = remove_context
+
+        if random_state is None:
+            raise ValueError("Must pass random_state to AWDTransformerXLDecoderBlock")
+
+        self.layers = nn.ModuleList()
+        if input_dim != model_dim:
+            raise ValueError("input_dim should match model_dim due to residual architecture, if this is not the case project the data or change dims! Have {}, sum = {}, model_dim = {}".format(input_dim, input_dim, model_dim))
+        if n_heads * head_dim != model_dim:
+            raise ValueError("head_dim * n_heads should == model_dim, have {} * {} != {}".format(head_dim, n_heads, model_dim))
+        self.n_layers = n_layers
+        self.device = device
+        if dtype == "default":
+            self.dtype = get_dtype_default()
+        else:
+            self.dtype = dtype
+
+        if self.dtype == "float32":
+            dtype = torch.float32
+        elif self.dtype == "float64":
+            dtype = torch.float64
+        else:
+            dtype = self.dtype
+
+        self.local_bias_ac = nn.Parameter(torch.zeros(n_heads, head_dim))
+        self.local_bias_bd = nn.Parameter(torch.zeros(n_heads, head_dim))
+
+        for i in range(n_layers):
+            l = RelativeDecoderLayer(input_dim,
+                                     n_heads=n_heads,
+                                     head_dim=head_dim,
+                                     model_dim=model_dim,
+                                     inner_dim=inner_dim,
+                                     attention_dropout_keep_prob=attention_dropout_keep_prob,
+                                     inner_dropout_keep_prob=inner_dropout_keep_prob,
+                                     random_state=random_state,
+                                     device=device,
+                                     dtype=dtype)
+            self.layers.append(l)
+
+        self.memory_len = memory_len
+        self.context_len = context_len
+        self.pos_emb = PositionalEmbedding(model_dim,
+                                           device=device,
+                                           dtype=dtype)
+        self.locked_drop_i = LockedDropout(input_dropout_keep_prob,
+                                           random_state=random_state,
+                                           device=device,
+                                           dtype=dtype)
+        self.locked_drop_h = LockedDropout(hidden_dropout_keep_prob,
+                                           random_state=random_state,
+                                           device=device,
+                                           dtype=dtype)
+        self.locked_drop_o = LockedDropout(output_dropout_keep_prob,
+                                           random_state=random_state,
+                                           device=device,
+                                           dtype=dtype)
+
+    def init_list_of_mems(self):
+        if self.device == "default":
+            device = get_device_default()
+        else:
+            device = self.device
+
+        if self.dtype == "float32":
+            dtype = torch.float32
+        elif self.dtype == "float64":
+            dtype = torch.float64
+        else:
+            dtype = self.dtype
+
+        # returns None if mem_len is 0 else
+        if self.memory_len > 0:
+            mems = []
+
+            for i in range(self.n_layers):
+                empty = torch.empty(0, dtype=dtype, device=torch.device(device))
+                mems.append(empty)
+            return mems
+        else:
+            return None
+
+    def update_list_of_mems(self, hiddens, list_of_mems, query_len, memory_len):
+        # mlen and qlen were swapped in call vs signature in original code!
+        # https://github.com/kimiyoung/transformer-xl/issues/96
+        # effectively, would mean memory_len= len query
+        # and query_len= 0 for PTB experiment
+        # where self.context_len was 70
+        # self.mem_len 0
+        # we swap the call to be correct, and set hyperparameters to actually use memory
+        if list_of_mems is None:
+            return None
+
+        if self.memory_len == 0:
+            return None
+
+        qlen = query_len
+        mlen = memory_len
+
+        assert len(hiddens) == len(list_of_mems), "len(list_of_mems) != len(hiddens)"
+
+        # Copied from transformer XL main code
+        # There are `mlen + qlen` steps that can be cached into mems
+        # For the next step, the last `ext_len` of the `qlen` tokens
+        # will be used as the extended context. Hence, we only cache
+        # the tokens from `mlen + qlen - self.ext_len - self.mem_len`
+        # to `mlen + qlen - self.ext_len`.
+        with torch.no_grad():
+            new_mems = []
+            end_idx = mlen + max(0, qlen - 0 - self.context_len)
+            beg_idx = max(0, end_idx - self.memory_len)
+            for i in range(len(hiddens)):
+                cat = torch.cat([list_of_mems[i], hiddens[i]], dim=0)
+                new_mems.append(cat[beg_idx:end_idx].detach())
+        return new_mems
+
+    def forward(self, input_tensor, input_mask_tensor=None, list_of_mems=None,
+                autoregressive_mask=True):
+        if not list_of_mems:
+            list_of_mems = self.init_list_of_mems()
+
+        shp = input_tensor.shape
+
+        qlen = shp[0]
+        mlen = list_of_mems[0].size(0) if list_of_mems is not None else 0
+        klen = mlen + qlen
+        # masking works internally by setting 1s to neg inf, 0s are left alone! This is slightly different than expected
+        # attention mask shows the position each tgt word (row) is allowed to look at (column).
+        # 0 1 1 1 1
+        # 0 0 1 1 1
+        # 0 0 0 1 1
+        # 0 0 0 0 1
+        if input_mask_tensor is None:
+            input_mask_tensor = (0. * input_tensor[:, :, 0]).long()
+        input_mask_tensor_dtype = input_mask_tensor.dtype
+        if autoregressive_mask:
+            attn_mask = torch.triu(input_tensor.new_ones(qlen, klen), diagonal=1 + mlen).bool()[:, :, None]
+            attn_mask = (attn_mask.type(input_mask_tensor_dtype) + input_mask_tensor[:, None, :] > 0).bool()
+        else:
+            attn_mask = input_tensor.new_zeros(qlen, klen).bool()[:, :, None]
+            attn_mask = (attn_mask.type(input_mask_tensor_dtype) + input_mask_tensor[:, None, :] > 0).bool()
+
+        # relative positional embedding
+        pos_seq = torch.arange(klen, -1, -1.0, device=input_tensor.device)
+        pe = self.pos_emb(pos_seq, batch_size=shp[1])
+        # one longer than expected because _rel_shift reduces size by 1
+
+        hids = []
+        core_out = self.locked_drop_i(input_tensor)
+        pe = self.locked_drop_i(pe)
+        for i, this_layer in enumerate(self.layers):
+            hids.append(core_out)
+            mems_i = list_of_mems[i] if list_of_mems is not None else None
+            core_out = this_layer(core_out, pe,
+                                  local_bias_ac=self.local_bias_ac[None, None],
+                                  local_bias_bd=self.local_bias_bd[None, None],
+                                  decoder_attention_mask=attn_mask, memory=mems_i)
+            if i < len(self.layers) - 1:
+                core_out = self.locked_drop_h(core_out)
+
+        # update memory
+        # mlen = 0
+        # qlen = len(inpt)
+        #new_mems = self.update_list_of_mems(hids, list_of_mems, mlen, qlen)
+        # original code had a bug, see comments for detail
+        new_mems = self.update_list_of_mems(hids, list_of_mems, qlen, mlen)
+
+        # slice according to context_len, normally set to 0
+        # in original code they do this via target size, but we don't have that information
+        if self.remove_context == True:
+            core_out = core_out[self.context_len:]
+        core_out = self.locked_drop_o(core_out)
+        return core_out, new_mems
+
+
+class AWDTransformerXLBlock(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 remove_context=False,
+                 n_layers=16,
+                 n_heads=10,
+                 head_dim=38,
+                 model_dim=380,
+                 inner_dim=900,
+                 input_dropout_keep_prob=0.4,
+                 attention_dropout_keep_prob=0.8,
+                 inner_dropout_keep_prob=0.8,
+                 hidden_dropout_keep_prob=1.0,
+                 output_dropout_keep_prob=0.5,
+                 random_state=None,
+                 memory_len=0,
+                 context_len=0,
+                 device="default",
+                 dtype="default"):
+        super(AWDTransformerXLBlock, self).__init__()
+        if dtype == "default":
+            self.dtype = get_dtype_default()
+        else:
+            self.dtype = dtype
+
+        if self.dtype == "float32":
+            dtype = torch.float32
+        elif self.dtype == "float64":
+            dtype = torch.float64
+        else:
+            dtype = self.dtype
+
+        if random_state is None:
+            raise ValueError("Must pass random_state to AWDTransformerXLBlock")
+
+        self.transformer = AWDTransformerXLBaseBlock(input_dim,
+                                                     remove_context=remove_context,
+                                                     n_layers=n_layers,
+                                                     n_heads=n_heads,
+                                                     head_dim=head_dim,
+                                                     model_dim=model_dim,
+                                                     inner_dim=inner_dim,
+                                                     input_dropout_keep_prob=input_dropout_keep_prob,
+                                                     attention_dropout_keep_prob=attention_dropout_keep_prob,
+                                                     inner_dropout_keep_prob=inner_dropout_keep_prob,
+                                                     hidden_dropout_keep_prob=hidden_dropout_keep_prob,
+                                                     output_dropout_keep_prob=output_dropout_keep_prob,
+                                                     random_state=random_state,
+                                                     memory_len=memory_len,
+                                                     context_len=context_len,
+                                                     device=device,
+                                                     dtype=dtype)
+
+    def init_list_of_mems(self):
+        return self.transformer.init_list_of_mems()
+
+    def update_list_of_mems(self, hiddens, list_of_mems, query_len, memory_len):
+        return self.transformer.update_list_of_mems(hiddens, list_of_mems, query_len, memory_len)
+
+
+    def forward(self, input_tensor, input_mask_tensor=None, list_of_mems=None,
+                autoregressive_mask=True):
+        """
+        # masking works internally by setting 1s to neg inf, 0s are left alone!
+        # attention mask shows the position each tgt word (row) is allowed to look at (column).
+        # 0 1 1 1 1
+        # 0 0 1 1 1
+        # 0 0 0 1 1
+        # 0 0 0 0 1
+        """
+        return self.transformer(input_tensor, input_mask_tensor, list_of_mems,
+                                autoregressive_mask=autoregressive_mask)
+
+
+class RampOpt(object):
+    """
+    Similar to NoamOpt but with specified "max" learning rate rather than derived from model size
+    Factor specifies whether ramp linearly or to the X power
+    Warmup describest the number of steps to ramp up learning rate
+    Decay to 0 by default, using cosine decay
+        terminates at decay_to_zero_at_steps
+    RampOpt(target_learning_rate, ramp_power, steps, opt)
+    return RampOpt(.0001, 1, 4000, 4000 * 100,
+                   torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+    can set decay_to_zero_at_steps to -1 to disable decay
+    """
+    def __init__(self, target_learning_rate, factor, warmup, decay_to_zero_at_steps, optimizer, min_decay_learning_rate=None):
+        self.optimizer = optimizer
+        self._step = 0
+        self.warmup = warmup
+        self.factor = factor
+        self.target_learning_rate = target_learning_rate
+        self.decay_to_zero_at_steps = decay_to_zero_at_steps
+        self.min_decay_learning_rate = min_decay_learning_rate
+        self._rate = 0
+
+    def step(self):
+        "Update parameters and rate"
+        self._step += 1
+        rate = self.rate()
+        for p in self.optimizer.param_groups:
+            p['lr'] = rate
+        self._rate = rate
+        self.optimizer.step()
+
+    def rate(self, step=None):
+        "Implement `lrate` above"
+        if step is None:
+            step = self._step
+        if step <= self.warmup:
+            return self.target_learning_rate * ((step / float(self.warmup)) ** self.factor)
+
+        if self.decay_to_zero_at_steps == -1:
+            return self.target_learning_rate
+
+        new_rate = self.target_learning_rate * np.cos((float(step - self.warmup) / (self.decay_to_zero_at_steps - self.warmup)) * (np.pi / 2.))
+
+        if self.min_decay_learning_rate is not None:
+            if new_rate < self.min_decay_learning_rate:
+                new_rate = self.min_decay_learning_rate
+
+        if step > self.decay_to_zero_at_steps:
+            if self.min_decay_learning_rate is None:
+                print("WARNING: RampOpt optimizer has decayed to LR 0! Current step {}, so no more learning happening!".format(step))
+                new_rate = 0.
+        # warmup is 0 on cos curve
+        # infinity is pi/2?
+        return new_rate
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    def state_dict(self):
+        return self.optimizer.state_dict()
+
+def clipping_grad_norm_(parameters, rescale, named_parameters=False, named_check=False):
+    # is a generator... get a static reference so the second iteration isn't empty
+    if named_check:
+        for n, p in parameters:
+            print("Checking {} grad.data".format(n))
+            assert p.grad.data is not None
+            print(p.grad.data.sum())
+            print("{}, OK".format(n))
+        raise ValueError("named_check complete!")
+    if not named_parameters:
+        _params = [p for p in parameters]
+    else:
+        _params = [p[1] for p in parameters]
+
+    grad_norm = torch.sqrt(sum([torch.sqrt(torch.pow(p.grad.data, 2).sum()) for p in _params]))
+    scaling_num = rescale
+    scaling_den = max([1.0 * rescale, grad_norm])
+    scaling = scaling_num / scaling_den
+    for p in _params:
+        p.grad.data.mul_(scaling)
+
+def clipping_grad_value_(parameters, clip_value, named_parameters=False, named_check=False):
+    # is a generator... get a static reference so the second iteration isn't empty
+    if named_check:
+        for n, p in parameters:
+            print("Checking {} grad.data".format(n))
+            assert p.grad.data is not None
+            print(p.grad.data.sum())
+            print("{}, OK".format(n))
+        raise ValueError("named_check complete!")
+    if not named_parameters:
+        _params = [p for p in parameters]
+    else:
+        _params = [p[1] for p in parameters]
+
+    clip_value = float(clip_value)
+    for p in _params:
+        p.grad.data.clamp_(min=-clip_value, max=clip_value)
+
+set_device_default(hp.use_device)
+set_dtype_default("float32")
+def get_hparams():
+    return hp
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.internal_seed = 112233
+        self.internal_np_random_state = np.random.RandomState(self.internal_seed)
+        hp = get_hparams()
+        self.use_device = torch.device(hp.use_device)
+        random_state = np.random.RandomState(hp.random_seed)
+        self.embedding = EmbeddingDropout(hp.max_vocabulary_size,
+                                          hp.transformer_input_dim // 2,
+                                          dropout_keep_prob=hp.embedding_dropout_keep_prob,
+                                          random_state=random_state,
+                                          device=self.use_device)
+        # Transformer XL defaults commented
+        self.transformer = AWDTransformerXLBlock(hp.transformer_input_dim,
+                                                 n_layers=hp.n_layers, #16,
+                                                 n_heads=hp.n_heads, #10
+                                                 head_dim=hp.head_dim, #38,
+                                                 model_dim=hp.model_dim, #380,
+                                                 inner_dim=hp.inner_dim, #900,
+                                                 input_dropout_keep_prob=hp.input_dropout_keep_prob, #0.4,
+                                                 attention_dropout_keep_prob=hp.attention_dropout_keep_prob, #0.8,
+                                                 inner_dropout_keep_prob=hp.inner_dropout_keep_prob, #0.8,
+                                                 hidden_dropout_keep_prob=hp.hidden_dropout_keep_prob, #1.0,
+                                                 output_dropout_keep_prob=hp.output_dropout_keep_prob, #0.5,
+                                                 random_state=random_state,
+                                                 memory_len=hp.memory_len,
+                                                 context_len=hp.context_len,
+                                                 device=self.use_device)
+        self.out_proj = nn.Linear(hp.transformer_input_dim,
+                                  hp.max_vocabulary_size,
+                                  device=self.use_device,
+                                  )
+
+    def forward(self, x, C, noise_x_based_on_mask=False, list_of_mems=None, disable_mems=False):
+        # x is a tensor of shape (T, N, 1)
+        # C is a tensor of 0s and 1s of shape (T, N)
+        # returns a tensor of shape (T, N, 1)
+        def lcl_get_random_pitches(shape, vocab_size, low=0):
+            random_pitch = torch.tensor(self.internal_np_random_state.randint(low=low, high=vocab_size, size=shape)).type(torch.LongTensor).to(device)
+            return random_pitch
+
+        def lcl_corrupt_pitch_mask(batch, mask, vocab_size):
+            random_pitches = lcl_get_random_pitches(batch.shape, vocab_size)
+            corrupted = (1 - mask[..., None]) * random_pitches + (1 * mask[..., None]) * batch
+            return corrupted
+
+        # get the number of batches
+        N = x.shape[0]
+
+        # mask convention is set for 0 == drop (or noise) 1 == keep
+        # shape is T, N
+        assert x.shape[-1] == 1
+        assert len(C.shape) == 2
+        corr_x = lcl_corrupt_pitch_mask(x, C, P)
+        in_x = corr_x if noise_x_based_on_mask else x
+        d_xe, d_de = self.embedding(in_x)
+        C = C[..., None] * 1. / (np.sqrt(hp.transformer_input_dim))
+        m_xe = (C + 0. * d_xe) # broadcast to same dim as input data
+
+        xe = torch.concat([d_xe, m_xe], axis=-1)
+        out, l_o_m = self.transformer(xe,
+                                      list_of_mems=list_of_mems,
+                                      autoregressive_mask=False)
+        p = self.out_proj(out)
+        return p, l_o_m
+
+device = get_device_default()
+model = Net().to(device)
+
+import time
+print(time.time())
+
+from IPython.display import clear_output
+import copy
+
+torch.cuda.empty_cache()
+model.train()
+_last_save = 0
+_last_show = 0
+_n_shown = 0
+_goldberg_mult = T // len(goldberg_like_line)
+_last_time = time.time()
+_save_time = 0
+
+def get_std_ramp_opt(model):
+    return RampOpt(learning_rate, 1, 5000, 5000 + 1000 * 125,
+                   torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.999), eps=1E-6),
+                   min_decay_learning_rate=min_learning_rate)
+
+optimizer = get_std_ramp_opt(model)
+
+losses = []
+
+N = batch_size
+data_random_state = np.random.RandomState(2122)
+gumbel_sampling_random_state = np.random.RandomState(3434)
+corruption_sampling_random_state = np.random.RandomState(1122)
+
+def gumbel_sample(logits, temperature=1.):
+    noise = gumbel_sampling_random_state.uniform(1E-5, 1. - 1E-5, logits.shape)
+    torch_noise = torch.tensor(noise).contiguous().to(device)
+
+    # max indices
+    maxes = torch.argmax(logits / float(temperature) - torch.log(-torch.log(torch_noise)), axis=-1, keepdim=True)
+    return maxes
+
+def get_random_pitches(shape, vocab_size, low=0):
+    random_pitch = torch.tensor(corruption_sampling_random_state.randint(low=low, high=vocab_size, size=shape)).type(torch.LongTensor).to(device)
+    return random_pitch
+
+def corrupt_pitch_mask(batch, mask, vocab_size):
+    random_pitches = get_random_pitches(batch.shape, vocab_size)
+    corrupted = (1 - mask[..., None]) * random_pitches + (1 * mask[..., None]) * batch
+    return corrupted
+
+# SUNDAE https://arxiv.org/pdf/2112.06749.pdf
+def build_logits_fn(vocab_size, n_unrolled_steps, enable_sampling):
+    def logits_fn(input_batch, input_mask, input_noise_x_based_on_mask=False):
+        def fn(batch, mask, noise_x_based_on_mask=False):
+            logits, _mem = model(batch, mask, noise_x_based_on_mask)
+            return logits
+
+        def unroll_fn(batch, mask, noise_x_based_on_mask=False):
+            samples = corrupt_pitch_mask(batch, mask, vocab_size)
+            all_logits = []
+            for _ in range(n_unrolled_steps):
+                logits = fn(samples, mask, noise_x_based_on_mask)
+                samples = gumbel_sample(logits).detach()
+                # sanity check to avoid issues with stacked outputs
+                assert samples.shape[1] == batch.shape[1]
+                # for the SUNDAE piece
+                samples = samples[:, :batch.shape[1]]
+                all_logits += [logits[None]]
+            final_logits = torch.cat(all_logits, dim=0)
+            return final_logits
+
+        if enable_sampling:
+            return fn(input_batch, input_mask, input_noise_x_based_on_mask)
+        else:
+            return unroll_fn(input_batch, input_mask, input_noise_x_based_on_mask)
+    return logits_fn
+
+def build_loss_fn(vocab_size, n_unrolled_steps=4):
+    logits_fn = build_logits_fn(vocab_size, n_unrolled_steps, enable_sampling=False)
+
+    def local_loss_fn(batch, mask):
+        # repeated targets are now n_unrolled_steps
+        repeated_targets = torch.cat([batch] * n_unrolled_steps, dim=1)
+        # T N 1 -> N T 1
+        repeated_targets = repeated_targets.permute(1, 0, 2)
+        assert repeated_targets.shape[-1] == 1
+        # N T 1 -> N T P
+        repeated_targets = F.one_hot(repeated_targets[..., 0].long(), num_classes=P)
+        t = torch.argmax(repeated_targets, axis=-1)
+
+        logits = logits_fn(batch, mask, False)
+        # S, T, N, P -> S, N, T, P
+        logits = logits.permute(0, 2, 1, 3)
+        out = logits.reshape(n_unrolled_steps * logits.shape[1], logits.shape[2], logits.shape[3])
+        logits = out
+        # N, T, P
+        raw_loss = -1. * (nn.functional.log_softmax(logits, dim=-1) * repeated_targets)
+        # mask is currently T, N
+        # change to N, T, 1, then stack for masking
+        # only keep loss over positions which were dropped, no freebies here
+        raw_masked_loss = raw_loss * torch.cat([(1. - mask.permute(1, 0)[..., None])] * n_unrolled_steps, dim=0)
+        # Active mask sums up the amount that were inactive in time
+        # downweighting more if more were dropped out
+        reduced_mask_active = torch.cat([1. / ((1. - mask).sum(dim=0) + 1)] * n_unrolled_steps, dim=0)[..., None, None]
+        reduced_loss = (reduced_mask_active * raw_masked_loss.view(n_unrolled_steps * N, T, P)).sum(dim=-1)
+        loss = torch.mean(reduced_loss, dim=1).mean()
+        # upweight by average actives in T since the overall 
+        # average penalty for mask weight reduction goes up the longer the sequence is
+        loss = (T / 2.) * loss
+        return loss
+    return local_loss_fn
+
+u_loss_fn = build_loss_fn(P, n_unrolled_steps=n_unrolled_steps)
+
+indices = data_random_state.choice(len(train_data), size=N)
+x = train_data[indices][..., None].transpose(1, 0, 2)
+
+C_prob = data_random_state.rand(N)
+C_mask_base = data_random_state.rand(T, N)
+C = 1 * (C_mask_base < C_prob[None, :])
+C = (1. - C) # convert to 0 drop format
+C = C.astype(np.int32)
+permanent_x = x
+permanent_C = C
+# update mask at a slower rate
+for i in range(n_train_steps):
+    if not DO_TRAIN:
+        break
+    # mask drawn with random probability
+    indices = data_random_state.choice(len(train_data), size=N)
+    x = train_data[indices][..., None].transpose(1, 0, 2)
+
+    if i % 1 == 0:
+        C_prob = data_random_state.rand(N)
+        C_mask_base = data_random_state.rand(T, N)
+        C = 1 * (C_mask_base < C_prob[None, :])
+        C = (1. - C) # convert to 0 drop format
+        C = C.astype(np.int32)
+        permanent_C = C
+
+    x = torch.tensor(x).type(torch.FloatTensor).to(device)
+    C2 = torch.tensor(permanent_C).type(torch.FloatTensor).to(device)
+
+    # x is of shape (T, N, 1)
+    # C2 is of shape (T, N) 
+    loss = u_loss_fn(x, C2)
+
+    losses.append(loss.item())
+    loss.backward()
+    clipping_grad_value_(model.parameters(), clip_grad)
+    optimizer.step()
+    optimizer.zero_grad()
+    del x
+    del C2
+
+    if i == 0 or (i - _last_show) > show_every:
+        _new_time = time.time()
+        _last_show = i
+        _n_shown += 1
+        if _n_shown >= 5:
+            _n_shown = 0
+            clear_output(wait=True)
+            plt.plot(losses)
+            plt.figure()
+            plt.plot(losses[-5000:])
+            plt.show()
+        print(i)
+        print('loss: ', loss.item())
+        print('approx time (sec) per step (ignoring save time): ', ((_new_time - _last_time) - _save_time) / float(show_every))
+        print('approx time (sec) per step (including save time): ', ((_new_time - _last_time) / float(show_every)))
+
+        _last_time = time.time()
+        _save_time = 0
+        model.train()
+
+    if _last_save == 0 or (i - _last_save) > save_every or i == (n_train_steps - 1):
+        _last_save = i
+        _save_start = time.time()
+        torch.save(model.state_dict(), 'model_{}.pt'.format(i + 1))
+        np.savez("model_train_losses_{}.npz".format(n_train_steps), losses=losses)
+        _save_end = time.time()
+        _save_time += (_save_end - _save_start)
+        print('save time (sec): ', (_save_end - _save_start))
+        model.train()
+
+save_mount_path = "sunmask_transformer_text8/"
+if not os.path.exists(save_mount_path):
+    os.mkdir(save_mount_path)
+if DO_TRAIN:
+    torch.save(model.state_dict(), save_mount_path + "model_{}sundaestep_{}trainstep.pth".format(n_unrolled_steps, n_train_steps))
+    np.savez(save_mount_path + "model_train_losses_{}sundaestep_{}trainstep.npz".format(n_unrolled_steps, n_train_steps), losses=losses)
+
+d = np.load(save_mount_path + "model_train_losses_{}sundaestep_{}trainstep.npz".format(n_unrolled_steps, n_train_steps))
+losses = d["losses"]
+model = Net().to(device)
+model.load_state_dict(torch.load(save_mount_path + "model_{}sundaestep_{}trainstep.pth".format(n_unrolled_steps, n_train_steps)))
+print("loaded {}".format(save_mount_path + "model_train_losses_{}sundaestep_{}trainstep.npz".format(n_unrolled_steps, n_train_steps)))
+
+plt.plot(losses)
+
+print(losses[-1])
+
+import random
+
+def seed_everything(seed=1234):
+    random.seed(seed)
+    tseed = random.randint(1, 1E6)
+    tcseed = random.randint(1, 1E6)
+    npseed = random.randint(1, 1E6)
+    ospyseed = random.randint(1, 1E6)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.manual_seed(tseed)
+    torch.cuda.manual_seed_all(tcseed)
+    np.random.seed(npseed)
+    # cannot set these inside colab :(
+    #torch.use_deterministic_algorithms(True)
+    #os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    #os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ['PYTHONHASHSEED'] = str(ospyseed)
+
+import time
+from google.colab import files
+from IPython.display import HTML, display, FileLink
+
+def sample_random(temperature=1.0, n_steps=2.0 * I * T,
+                  batch_size=1,
+                  n_reps_per_mask=1,
+                  n_reps_final_mask_dwell=0,
+                  o_nade_eta=0.75,
+                  sundae_keep_prob=0.33, top_k=0, top_p=0.0,
+                  use_typical_sampling=False,
+                  intermediate_corrupt=False,
+                  frozen_mask=False,
+                  use_evener=False, seed_offset=0):
+    core_state = np.random.RandomState(12765 + seed_offset)
+
+    melody_seed = core_state.randint(100000)
+    all_seed = core_state.randint(100000)
+    internal_seed = core_state.randint(100000)
+    harmonize_seed = core_state.randint(100000)
+
+    seed_everything(all_seed)
+    model.internal_np_random_state = np.random.RandomState(internal_seed)
+
+    D = np.zeros((batch_size, T)).astype(int).transpose(1, 0)
+    y = core_state.randint(P, size=(batch_size, T)).transpose(1, 0)[..., None]
+    last_time = time.time()
+    new_sent = torch_infer_transformer(y, D, model,
+                                 n_steps=n_steps,
+                                 n_reps_per_mask=n_reps_per_mask,
+                                 n_reps_final_mask_dwell=n_reps_final_mask_dwell,
+                                 o_nade_eta=o_nade_eta,
+                                 temperature=temperature,
+                                 sundae_keep_prob=sundae_keep_prob,
+                                 top_k=top_k,
+                                 top_p=top_p,
+                                 use_typical_sampling=use_typical_sampling,
+                                 use_evener=use_evener,
+                                 initial_corrupt=True,
+                                 intermediate_corrupt=intermediate_corrupt,
+                                 frozen_mask=frozen_mask,
+                                 seed=melody_seed, verbose=False)
+    new_time = time.time()
+    print("sampled in {} s".format(new_time - last_time))
+    for i in range(new_sent.shape[1]):
+        print("".join([ind_to_vocab[e] for e in new_sent[:, i].ravel()]))
+
+temperature_to_test = .6
+steps_to_test = 500
+batch_size_to_test = 20
+n_reps_per_mask_to_test = 1
+n_reps_final_mask_dwell_to_test = 100
+keep_to_test = "triangular"
+top_k_to_test = 0
+top_p_to_test = 0.2
+seed_offset_to_test = 5945
+typical_sampler_to_test = True
+swap_at_eta_to_test = False
+evener_to_test = True
+intermediate_noise_to_test = True
+frozen_mask_to_test = False
+
+sample_random(temperature=temperature_to_test,
+              batch_size=batch_size_to_test,
+              n_steps=steps_to_test,
+              n_reps_per_mask=n_reps_per_mask_to_test,
+              n_reps_final_mask_dwell=n_reps_final_mask_dwell_to_test,
+              sundae_keep_prob=keep_to_test,
+              top_k=top_k_to_test,
+              top_p=top_p_to_test,
+              swap_at_eta=swap_at_eta_to_test,
+              use_typical_sampling=typical_sampler_to_test,
+              intermediate_corrupt=intermediate_noise_to_test,
+              frozen_mask=frozen_mask_to_test,
+              use_evener=evener_to_test, seed_offset=seed_offset_to_test)
+
+sample_random(temperature=temperature_to_test,
+              batch_size=batch_size_to_test,
+              n_steps=steps_to_test,
+              n_reps_per_mask=n_reps_per_mask_to_test,
+              n_reps_final_mask_dwell=n_reps_final_mask_dwell_to_test,
+              sundae_keep_prob=keep_to_test,
+              top_k=top_k_to_test,
+              top_p=top_p_to_test,
+              swap_at_eta=swap_at_eta_to_test,
+              use_typical_sampling=False,
+              intermediate_corrupt=intermediate_noise_to_test,
+              frozen_mask=frozen_mask_to_test,
+              use_evener=evener_to_test, seed_offset=seed_offset_to_test)
